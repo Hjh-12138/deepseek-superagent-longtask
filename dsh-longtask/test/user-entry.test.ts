@@ -41,6 +41,42 @@ async function fixture(overrides: Partial<LongtaskConfig> = {}){
     async close(){for(const stop of teardowns.splice(0))await stop();for(const scope of scopes)await scope.dispose();await root.fiber.dispose()}};
 }
 
+function addEngineeringCatalog(f:Awaited<ReturnType<typeof fixture>>){
+  writeFileSync(join(f.experts,"divisions.json"),JSON.stringify({divisions:{research:{label:"Research"},engineering:{label:"Engineering"},testing:{label:"Testing"}}}));
+  const definitions=[
+    ["engineering/frontend.md","Frontend Developer","Build accessible React and Vue user interfaces"],
+    ["engineering/backend.md","Backend Architect","Design backend services and server architecture"],
+    ["engineering/database.md","Database Optimizer","Optimize SQL databases and query performance"],
+    ["engineering/architect.md","Software Architect","Design software system architecture"],
+    ["engineering/reviewer.md","Code Reviewer","Independent code review and correctness"],
+    ["testing/automation.md","Test Automation Engineer","Automated tests and regression suites"],
+  ];
+  for(const [rel,name,intro] of definitions){mkdirSync(join(f.experts,rel!.split('/')[0]!),{recursive:true});writeFileSync(join(f.experts,rel!),`---\nname: ${name}\ndescription: ${intro}\n---\nEXPERT_BODY_SHOULD_STAY_LAZY`);}
+}
+
+test("专家入口支持中文数据库检索，不加载专家正文或启动Worker",async()=>{
+  const f=await fixture();try{
+    addEngineeringCatalog(f);const result=await f.ok("longtask_experts",{query:"数据库"});
+    assert.equal(result.experts[0]?.relPath,"engineering/database.md");assert.doesNotMatch(JSON.stringify(result),/EXPERT_BODY_SHOULD_STAY_LAZY/);assert.equal(f.created.length,0);
+  }finally{await f.close();}
+});
+
+test("完整开发任务返回职责推荐；前后端方案提示测试等专职空缺，不自动加人",async()=>{
+  const f=await fixture();try{
+    addEngineeringCatalog(f);const goal="开发Vue前端和FastAPI后端的客资系统，用SQLite数据库持久化，并用pytest编写自动化测试";
+    const result=await f.ok("longtask_experts",{query:"前端",task:goal,limit:1});
+    assert.equal(result.experts[0].relPath,"engineering/frontend.md");assert.ok(result.catalogTotal>result.experts.length);
+    assert.equal(result.recommendation.domain,"software");
+    assert.ok(result.recommendation.responsibilities.some((r:any)=>r.id==="database"&&r.candidates.some((e:any)=>e.relPath==="engineering/database.md")));
+    assert.ok(result.recommendation.responsibilities.some((r:any)=>r.id==="testing"&&r.candidates.some((e:any)=>e.relPath==="testing/automation.md")));
+    const p=await f.ok("longtask_propose",f.proposal({goal,executorRelPaths:["engineering/frontend.md","engineering/backend.md"],acceptorRelPath:"engineering/reviewer.md",assignments:[{relPath:"engineering/frontend.md",deliverables:[join(f.directory,"result.md")]},{relPath:"engineering/backend.md",deliverables:[join(f.directory,"backend.md")]}],deliverables:[join(f.directory,"result.md"),join(f.directory,"backend.md")]}));
+    assert.equal(p.task.executors.length,2);assert.equal(f.created.length,0);
+    assert.ok(p.task.staffingReview.needsDiscussion.some((r:any)=>r.id==="testing"));
+    assert.ok(p.recommendation.responsibilities.some((r:any)=>r.id==="testing"&&r.candidates.some((e:any)=>e.relPath==="testing/automation.md")),"仅按前后端提交方案时也应自动返回职责候选");
+    await f.ok("longtask_confirm",{taskId:p.task.taskId,version:1});assert.match(f.approvals[0].questions[0].detail,/专职专家|兼任/);assert.equal(f.created.length,2);
+  }finally{await f.close();}
+});
+
 test("金额由用户填写：模型建议不生效，工具参数不能代填总额，完整方案只确认一次",async()=>{
   const f=await fixture();try{
     const p=await f.ok('longtask_propose',f.proposal({suggestedBudgetCny:'999'})),id=p.task.taskId;

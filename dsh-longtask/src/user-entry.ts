@@ -2,6 +2,7 @@ import {createHash} from "node:crypto";
 import {isAbsolute} from "node:path";
 import {statSync} from "node:fs";
 import {pendingApprovals} from "./approval-waits.js";
+import {searchExperts, recommendExperts, reviewStaffing} from "./catalog/recommend.js";
 import type {HostContext} from "./host-types.js";
 import type {TaskService, ProposeInput} from "./tasks/task-service.js";
 import type {TokenLedger} from "./ledger/token-ledger.js";
@@ -57,7 +58,8 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
     const v = o.tasks.currentVersion(t);
     return {taskId: t.id, version: v.version, goal: v.goal, criteria: v.criteria, deliverables: v.deliverables,
       executors: v.executors.map(e => ({relPath: e.relPath, name: e.name, contentHash: e.contentHash})), acceptor: {relPath: v.acceptor.relPath, name: v.acceptor.name, contentHash: v.acceptor.contentHash},
-      assignments: v.assignments ?? [], requiredTools: v.requiredTools ?? [], budget: v.budget.money ?? v.budget};
+      assignments: v.assignments ?? [], requiredTools: v.requiredTools ?? [], budget: v.budget.money ?? v.budget,
+      staffingReview: reviewStaffing(v.goal, v.executors, v.acceptor)};
   };
   const fingerprint = (t: Task) => createHash("sha256").update(JSON.stringify(plan(t))).digest("hex");
   const budgetView = (t: Task) => {const b = o.ledger.getBudget(t.id), p = o.tasks.currentVersion(t).budget; if (p.money) return o.ledger.moneyView(t.id) ?? {currency: "CNY", limitAmount: null, suggestedAmount: p.money.suggestedAmount ?? null, requiresUserAmount: true}; return {limitTokens: b?.limitTokens ?? p.limitTokens, settledTokens: b?.settledTokens ?? 0, reservedTokens: b?.reservedTokens ?? 0, availableTokens: b ? b.limitTokens - b.settledTokens - b.reservedTokens : p.limitTokens, strict: b?.strict ?? p.strict}};
@@ -80,6 +82,7 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
     const reason = [operation ?? (name === "longtask_confirm" ? "确认按以下方案开始长任务" : "确认在原预算内恢复长任务"), `任务：${t.id}；方案版本：${p.version}`,
       `目标：${p.goal}`, "完成标准：", ...p.criteria.map(c => `- ${c.id}：${c.text}`), "交付物：", ...p.deliverables.map(d => `- ${d}`),
       `执行专家：${p.executors.map(e => `${e.name}（${e.relPath}）`).join("、")}`, `独立验收：${p.acceptor.name}（${p.acceptor.relPath}）`,
+      ...(p.staffingReview.needsDiscussion.length ? [`职责覆盖提醒：${p.staffingReview.needsDiscussion.map(r=>r.label).join("、")}未选专职专家，可由现有人选兼任；请核对分工和完成标准中由谁负责，不会自动增加专家或预算。`] : []),
       `分工：${JSON.stringify(p.assignments)}`, `任务工作目录：${o.workspace}`, money ?
         `人民币总上限：${money.limitAmount === null ? "待您填写" : "¥" + money.limitAmount}；核算账本：${JSON.stringify(o.ledger.moneyView(t.id))}。${money.suggestedAmount ? `Agent建议¥${money.suggestedAmount}，仅供参考。` : ""}\n按模型价格与用量核算；内置价格按高峰价保守核算，不是平台实扣；预算仅含本任务托管模型请求，第三方付费工具不在其中。` :
         `历史任务固定Token上限：${o.tasks.currentVersion(t).budget.limitTokens}；已用：${b?.settledTokens ?? 0}；在途：${b?.reservedTokens ?? 0}`,
@@ -121,10 +124,15 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
       }}));
   };
   try {
-    define("longtask_experts", "检索本地专家目录。先按任务主题找人；用返回的relPath提交方案。只返回简介，不读取专家全文，不启动执行。", object({query: {type: "string", maxLength: 200}, offset: integer, limit: {type: "integer", minimum: 1, maximum: 50}}), async (a, exec) => {
+    define("longtask_experts", "中文或英文检索本地专家。提交方案前用task传完整目标与技术栈，查看职责及候选推荐，再按复杂度与预算确定分工；小任务可兼任，不固定前后端两人。query可额外过滤目录页，不裁掉task职责推荐。仅返回元数据，专家全文派工时注入，不启动Worker。", object({query: {type: "string", maxLength: 200}, task: string, offset: integer, limit: {type: "integer", minimum: 1, maximum: 50}}), async (a, exec) => {
       const query = typeof a.query === "string" ? a.query.toLowerCase().trim() : "", offset = a.offset === undefined ? 0 : number(a.offset, "offset"), limit = a.limit === undefined ? 20 : number(a.limit, "limit", 1);
-      if (limit > 50) throw Error("limit最大为50"); const items = (await o.experts()).filter(e => [e.name, e.intro, e.division, e.relPath].some(s => s.toLowerCase().includes(query))); assertCaller(exec);
-      return {total: items.length, offset, workspace: o.workspace, experts: items.slice(offset, offset + limit).map(({relPath, name, division, intro}) => ({relPath, name, division, intro}))};
+      if (a.query !== undefined && (typeof a.query !== "string" || a.query.length > 200)) throw Error("query必须是不超过200字的文本");
+      if (limit > 50) throw Error("limit最大为50"); const taskText = a.task === undefined ? query : text(a.task,"任务目标"),catalog = await o.experts();
+      const items = searchExperts(catalog,query || (a.task === undefined ? "" : taskText)); assertCaller(exec);
+      const counts = new Map<string,number>(); for (const e of catalog) counts.set(e.division,(counts.get(e.division)??0)+1);
+      return {total: items.length, offset, workspace: o.workspace, catalogTotal:catalog.length, divisions:[...counts].map(([division,count])=>({division,count})),
+        recommendation:recommendExperts(catalog,taskText),
+        experts: items.slice(offset, offset + limit).map(({expert:{relPath,name,division,intro},score,matchedResponsibilities})=>({relPath,name,division,intro,score,matchedResponsibilities}))};
     });
     define("longtask_propose", "生成待确认长任务方案，支持修改尚未启动的方案。必须明确目标、标准、绝对交付路径、执行和独立验收专家；可提供suggestedBudgetCny作为人民币预算建议。实际金额必须由用户在longtask_confirm的宿主输入框填写，Agent不能设定总上限；有歧义先澄清。不启动Worker。", object({
       goal: string, criteria: {type: "array", minItems: 1, maxItems: 32, items: criterionSchema}, deliverables: strings(32), executorRelPaths: strings(8), acceptorRelPath: string, suggestedBudgetCny: {type: "string", pattern: "^(0|[1-9][0-9]{0,6})(\\.[0-9]{1,9})?$"},
@@ -152,10 +160,10 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
         assertCaller(exec); const t = task(text(a.taskId, "任务ID"));
         if (t.status !== "proposed" || t.versions.some(v => v.confirmedAt) || o.tasks.getSessions(t.id).length) throw Error("只能修改从未启动的待确认方案");
         if (o.tasks.currentVersion(t).version !== number(a.expectedVersion, "方案版本", 1)) throw Error("方案版本已变化，请先查看最新方案");
-        await o.tasks.proposeNewVersion(t.id, input); invalidate(t.id); return {task: view(task(t.id)), next: "请用户核对当前版本；使用longtask_confirm完成宿主确认后才开始"};
+        await o.tasks.proposeNewVersion(t.id, input); invalidate(t.id); return {task: view(task(t.id)), recommendation: recommendExperts([...catalog.values()],goal), next: "请先核对staffingReview和职责候选，明确兼任安排，再由用户确认当前版本；使用longtask_confirm完成宿主确认后才开始"};
       });
       const parent = a.parentTaskId === undefined ? undefined : text(a.parentTaskId, "父任务ID"); if (parent) task(parent);
-      assertCaller(exec); const t = await o.tasks.propose(input, parent, parent ? "child" : "none", exec.agent!.session!.id!); return {task: view(t), next: "方案尚未执行；用户可调整，使用longtask_confirm展示方案并完成宿主确认"};
+      assertCaller(exec); const t = await o.tasks.propose(input, parent, parent ? "child" : "none", exec.agent!.session!.id!); return {task: view(t), recommendation: recommendExperts([...catalog.values()],goal), next: "方案尚未执行；先核对staffingReview与职责候选，明确兼任安排。用户可调整，使用longtask_confirm展示方案并完成宿主确认"};
     });
     define("longtask_confirm", "将当前方案交给宿主展示给用户确认；仅用户同意后启动。必须传入longtask_propose/longtask_tasks返回的taskId和version；不接受模型代填已确认标记，不追加预算。", object({taskId: taskIdSchema, version: versionSchema}, ["taskId", "version"]), async (a, exec) => {
       const id = text(a.taskId, "任务ID"), version = number(a.version, "方案版本", 1), original = task(id);

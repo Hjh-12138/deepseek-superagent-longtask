@@ -50,6 +50,7 @@ import type { ExpertRef, Task, Verdict, LedgerEntry } from "./types.js";
 import { registerUserTaskTools, USER_TASK_TOOLS, USER_TASK_ENTRY_PROTOCOL } from "./user-entry.js";
 import {RouterNotices, ROUTER_NOTICE_PROTOCOL} from "./router-notices.js";
 import {ApprovalWaits} from "./approval-waits.js";
+import {searchExperts as rankExperts, recommendExperts} from "./catalog/recommend.js";
 
 export const name = "longtask";
 
@@ -777,10 +778,7 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
       let catalogCache: Awaited<ReturnType<typeof scanCatalog>> | null = null;
       const searchExperts = async (query: string) => {
         if (!catalogCache) catalogCache = await scanCatalog(cfg.agencyAgentsRoot, join(cfg.agencyAgentsRoot, "divisions.json"));
-        const q = query.toLowerCase();
-        return catalogCache.experts
-          .filter((e) => e.name.toLowerCase().includes(q) || e.intro.toLowerCase().includes(q) || e.division.includes(q))
-          .slice(0, 20);
+        return rankExperts(catalogCache.experts,query).slice(0,20).map(m=>m.expert);
       };
 
       // ---- 用户任务入口（P1-4）：ctx.provide 暴露同一 TaskService ----
@@ -796,7 +794,7 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
         getTask: (taskId: string) => tasks.getTask(taskId),
         listTasks: () => tasks.listTasks(),
         getRuntimeInfo: () => ({ stage3Protocol: 2, budgetProtectionVersion: ledger.protectedReserveVersion, ready: runtimeReady, maxConcurrentTasks: cfg.maxConcurrentTasks,
-          userEntryProtocol: USER_TASK_ENTRY_PROTOCOL, moneyAccountingProtocol: ledger.moneyAccountingProtocol, routerNoticeProtocol: ROUTER_NOTICE_PROTOCOL, approvalWaitProtocol: 1, userActionsProtocol: tasks.userActionsProtocol, requestAccountingProtocol: ledger.requestAccountingProtocol, acceptorReadOnly: cfg.acceptorReadOnly, userEntryReady,
+          userEntryProtocol: USER_TASK_ENTRY_PROTOCOL, moneyAccountingProtocol: ledger.moneyAccountingProtocol, routerNoticeProtocol: ROUTER_NOTICE_PROTOCOL, approvalWaitProtocol: 1, expertCatalogProtocol: 2, expertRecommendationProtocol: 1, userActionsProtocol: tasks.userActionsProtocol, requestAccountingProtocol: ledger.requestAccountingProtocol, acceptorReadOnly: cfg.acceptorReadOnly, userEntryReady,
           stallThresholdMs: cfg.stallThresholdMs, watchdogIntervalMs: cfg.watchdogIntervalMs,
           pid: process.pid, bootAt: Math.round((Date.now() - process.uptime() * 1000) / 1000), instanceId }),
         getTaskSessions: (taskId: string) => structuredClone(tasks.getSessions(taskId)),
@@ -808,6 +806,10 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
         /** 待结算验收轮次的检查点（验收进度），无则 undefined */
         getAcceptanceProgress: (taskId: string) => tasks.latestPendingRound(taskId)?.checkpoint,
         searchExperts,
+        recommendExperts: async (task: string) => {
+          if (!catalogCache) catalogCache = await scanCatalog(cfg.agencyAgentsRoot, join(cfg.agencyAgentsRoot, "divisions.json"));
+          return recommendExperts(catalogCache.experts, task);
+        },
         registerArtifact: (taskId: string, location: string, contentHash: string | null, ownerRelPath: string) =>
           tasks.registerArtifact(taskId, location, contentHash, ownerRelPath),
         // ---- 阶段 2：专家协作 ----

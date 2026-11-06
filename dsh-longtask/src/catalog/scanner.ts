@@ -7,7 +7,7 @@
  */
 
 import { promises as fs } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { join, relative, sep, resolve, isAbsolute } from "node:path";
 import { contentHash } from "../store/store.js";
 import type { ExpertRef } from "../types.js";
 
@@ -43,7 +43,7 @@ export function parseFrontMatter(text: string): { fields: Record<string, string>
 
 /**
  * 扫描专家库根目录。divisionsPath 指向 divisions.json；rootPath 是专家库根目录。
- * 只扫描 divisions.json 中列出的顶级目录（设计文档 §4）。
+ * 递归扫描 divisions.json 列出的分类；不跟随符号链接或目录联接。
  */
 export async function scanCatalog(rootPath: string, divisionsPath: string): Promise<CatalogScanResult> {
   const raw = await fs.readFile(divisionsPath, "utf8");
@@ -53,16 +53,31 @@ export async function scanCatalog(rootPath: string, divisionsPath: string): Prom
   const skipped: CatalogScanResult["skipped"] = [];
 
   for (const division of Object.keys(divisions)) {
+    if (!division || division !== division.trim() || division.endsWith(".") || /[\\/:]/.test(division) || isAbsolute(division)) {
+      skipped.push({path: division, reason: "无效分类目录名"}); continue;
+    }
     const dir = join(rootPath, division);
-    let entries: string[];
+    const files: string[] = [];
+    const walk = async (directory: string): Promise<void> => {
+      let entries;
+      try { entries = await fs.readdir(directory, {withFileTypes: true}); }
+      catch { skipped.push({path: relative(rootPath, directory), reason: "分类目录读取失败"}); return; }
+      for (const entry of entries.sort((a,b)=>a.name.localeCompare(b.name))) {
+        const path = join(directory, entry.name);
+        if (entry.isSymbolicLink()) {skipped.push({path: relative(rootPath,path), reason: "跳过符号链接或目录联接"}); continue;}
+        if (entry.isDirectory()) await walk(path);
+        else if (entry.isFile() && entry.name.endsWith(".md")) files.push(path);
+      }
+    };
     try {
-      entries = await fs.readdir(dir);
+      const stat = await fs.lstat(dir);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {skipped.push({path:division,reason:"分类必须是普通目录"});continue;}
+      await walk(dir);
     } catch {
       skipped.push({ path: division, reason: "分类目录不存在" });
       continue;
     }
-    for (const entry of entries.filter((e) => e.endsWith(".md"))) {
-      const abs = join(dir, entry);
+    for (const abs of files) {
       let text: string;
       try {
         text = await fs.readFile(abs, "utf8");
@@ -99,7 +114,13 @@ export async function loadExpertDefinition(
   rootPath: string,
   ref: Pick<ExpertRef, "relPath" | "contentHash">,
 ): Promise<{ text: string; hashMatches: boolean; currentHash: string }> {
-  const abs = join(rootPath, ref.relPath);
+  const abs = resolve(rootPath, ref.relPath), rel = relative(resolve(rootPath), abs);
+  if (!rel || isAbsolute(ref.relPath) || isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) throw Error("专家路径必须在专家库内");
+  let current = resolve(rootPath);
+  for (const part of rel.split(sep)) {
+    current = join(current, part);
+    if ((await fs.lstat(current)).isSymbolicLink()) throw Error("专家定义不能通过符号链接加载");
+  }
   const text = await fs.readFile(abs, "utf8");
   const currentHash = await contentHash(text);
   return { text, hashMatches: currentHash === ref.contentHash, currentHash };
