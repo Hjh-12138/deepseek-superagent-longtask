@@ -106,7 +106,7 @@ export interface Task {
 
 export interface WaitingState {
   /** 在等什么：后台命令 / 某位专家 / 用户答复 / 验收结果 */
-  kind: "background_command" | "expert_message" | "user_reply" | "acceptance" | "external";
+  kind: "background_command" | "expert_message" | "user_reply" | "user_approval" | "acceptance" | "external";
   description: string;
   /** 唤醒条件的事件类型或去重键 */
   wakeCondition: string | null;
@@ -120,7 +120,7 @@ export interface WaitingState {
 export interface TaskWait {
   id: string;
   taskId: string;
-  kind: "background_command" | "expert_message" | "user_reply" | "acceptance" | "external";
+  kind: WaitingState["kind"];
   description: string;
   /** 唤醒条件：dependency:<relPath> / acceptance / user_reply / turn:<turnId>；null 表示只能人工解除 */
   wakeCondition: string | null;
@@ -268,6 +268,7 @@ export interface TaskBudgetState {
 export type EventType =
   | "task.proposed"
   | "task.router_bound"
+  | "task.approval_changed"
   | "task.confirmed"
   | "task.dispatch"
   | "task.continue"

@@ -1,6 +1,7 @@
 import {createHash} from "node:crypto";
 import {isAbsolute} from "node:path";
 import {statSync} from "node:fs";
+import {pendingApprovals} from "./approval-waits.js";
 import type {HostContext} from "./host-types.js";
 import type {TaskService, ProposeInput} from "./tasks/task-service.js";
 import type {TokenLedger} from "./ledger/token-ledger.js";
@@ -64,6 +65,8 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
     const b = o.ledger.getBudget(t.id), p = plan(t);
     const evidence = o.tasks.getTaskEvidence(t.id), pauseEvent = evidence.eventOrder.map(id => evidence.events[id] as {type?: string; payload?: {note?: string}}).filter(e => e.type === "task.paused").at(-1);
     return {...p, routerSessionId: t.routerSessionId ?? null, relatedTaskId: t.relatedTaskId, relationKind: t.relationKind, status: t.status, pauseReason: t.pauseReason, pauseNote: t.status === "paused" ? pauseEvent?.payload?.note ?? null : null, waiting: t.waitingOn,
+      pendingApprovals: pendingApprovals(evidence, t.id)
+        .map(a => ({sessionId: a.sessionId, expert: a.relPath, role: a.role, requestId: a.requestId, toolName: a.toolName, reason: a.reason})),
       accountingIssue: o.ledger.accountingIssue(t.id) ?? null, unknownAnswerDelivery: o.tasks.getClarificationAnswers(t.id).some(a => a.delivery === "unknown"),
       ...(o.tasks.currentVersion(t).budget.money ? {recentModelExpenses: o.ledger.moneyEntries(t.id)} : {}),
       budget: budgetView(t),

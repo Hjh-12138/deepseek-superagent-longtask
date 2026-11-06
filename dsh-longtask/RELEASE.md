@@ -1,6 +1,6 @@
 # 安装、升级与发布验收
 
-当前产物为 `0.1.2-rc.4` 发布候选版，通过tgz离线分发。package.json保留private，未发布npm registry。支持核对过的DSH桌面/SDK版本为 `0.2.1-rc.5` 和 `0.2.2-rc.1`，运行时Node需>=22；本轮离线回归使用Node24。rc.4修复单次输出截断与后台命令/专家等待交错时误暂停整任务的问题，历史费用待核对记录不会因升级而解除。
+当前产物为 `0.1.2-rc.5` 发布候选版，通过tgz离线分发。package.json保留private，未发布npm registry。支持核对过的DSH桌面/SDK版本为 `0.2.1-rc.5` 和 `0.2.2-rc.1`，运行时Node需>=22；本轮离线回归使用Node24。rc.5增加工具审批等待、Router通知与审批失效清理；历史费用待核对记录不会因升级而解除。
 
 ## 安装和配置
 
@@ -8,7 +8,9 @@
 2. 在当前profile的bundle列表中只保留核心；开发profile可另行保留E2E。不要把联调消费者放入正式profile，也不要删除开发目录及验收档案。
 3. 按 `release/config.example.yml` 设置已安装longtask实例的配置。不要再次插入第二个同名实例。工作目录和专家库必须实际存在，专家库需有divisions.json及专家Markdown。凭证由宿主提供，不写入本包。
 4. 首次使用正式环境，给dataDir一个独立目录。旧开发`.longtask/state.json`不迁移进新库，38个联调任务保留原处。正式目录为空时，查询应返回0项。
-5. **完整退出并重启DSH进程**，不能只关闭隐藏到后台的窗口，也不能仅依赖热重载。检查日志`user-entry:ready=true`，运行信息ready/userEntryReady为true、userEntryProtocol为3、moneyAccountingProtocol/routerNoticeProtocol为1、userActionsProtocol/requestAccountingProtocol为1。新任务开工还需userQuestions.ask输入通道。
+5. **完整退出并重启DSH进程**，不能只关闭隐藏到后台的窗口，也不能仅依赖热重载。检查日志`user-entry:ready=true`，运行信息ready/userEntryReady为true、userEntryProtocol为3、moneyAccountingProtocol为1、routerNoticeProtocol为2、approvalWaitProtocol为1、userActionsProtocol/requestAccountingProtocol为1。新任务开工还需userQuestions.ask输入通道。
+
+工具审批依赖宿主的 `approval/asked`、`approval/decided` 会话事件。主会话收到的是可见状态摘要，不会因此自动调用模型；实际批准或拒绝仍由用户在对应 Worker 的宿主审批卡片完成。重载时未结束的原审批会失效，任务暂停核对，不自动重放工具或假定用户批准。
 
 未配置目录时默认使用当前用户：dataDir为 `~/.dsh/longtask`，专家库 `~/.dsh/agency-agents`，工作区 `~/Documents/deepseek-harness/default-workspace`。也可在启动DSH的进程环境配置 `DSH_LONGTASK_DATA_DIR`、`DSH_LONGTASK_EXPERTS_ROOT`、`DSH_LONGTASK_WORKSPACE`；实例显式配置优先。环境变量在模块加载时读取，改后要重启。工作目录不存在时正式提案会拒绝，不猜另一个写入位置。
 

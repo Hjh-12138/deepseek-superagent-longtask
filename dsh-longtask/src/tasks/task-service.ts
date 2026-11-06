@@ -3222,7 +3222,9 @@ export class TaskService {
     const task = this.getTask(taskId);
     if (!task || (task.status !== "active" && task.status !== "rework")) return false;
     const version = this.currentVersion(task);
-    const owner = version.executors[0]!.relPath;
+    const approvalOwners = new Set(this.listWaits(taskId).filter(w => w.status === "waiting" && w.taskVersion === version.version && w.kind === "user_approval" && w.observed).map(w => w.executorRelPath));
+    const owner = version.executors.find(e => !approvalOwners.has(e.relPath))?.relPath;
+    if (!owner) return false;
     const dedupeKey = `watchdog:${taskId}:${instructionKey(instruction)}:${this.now().toISOString()}`;
     const delivered = await this.gatedDeliver(
       task,

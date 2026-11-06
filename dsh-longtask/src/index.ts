@@ -49,6 +49,7 @@ import type { AgentHandle, HostContext, SessionEvent } from "./host-types.js";
 import type { ExpertRef, Task, Verdict, LedgerEntry } from "./types.js";
 import { registerUserTaskTools, USER_TASK_TOOLS, USER_TASK_ENTRY_PROTOCOL } from "./user-entry.js";
 import {RouterNotices, ROUTER_NOTICE_PROTOCOL} from "./router-notices.js";
+import {ApprovalWaits} from "./approval-waits.js";
 
 export const name = "longtask";
 
@@ -756,6 +757,10 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
         diag("delegation:guard-unavailable（任务模型步骤将拒绝，防止未托管委派绕过预算）");
       }
 
+      const approvalWaits = new ApprovalWaits(store, message => ctx.logger.warn(`longtask: ${message}`));
+      disposers.push(() => approvalWaits.dispose());
+      for (const id of await approvalWaits.restore()) await tasks.pause(id, "missing_input", "运行时重载后原工具审批已失效；请核对Worker会话，再由用户恢复并重新处理宿主审批。未重放工具操作。", true);
+
       // ---- 重启恢复：先核对再动作 ----
       const recovery = await recoverOnStartup(store, host, ledger);
       diag(`stage:recovery kept=${recovery.kept.length} reactivated=${recovery.reactivated.length}`);
@@ -791,7 +796,7 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
         getTask: (taskId: string) => tasks.getTask(taskId),
         listTasks: () => tasks.listTasks(),
         getRuntimeInfo: () => ({ stage3Protocol: 2, budgetProtectionVersion: ledger.protectedReserveVersion, ready: runtimeReady, maxConcurrentTasks: cfg.maxConcurrentTasks,
-          userEntryProtocol: USER_TASK_ENTRY_PROTOCOL, moneyAccountingProtocol: ledger.moneyAccountingProtocol, routerNoticeProtocol: ROUTER_NOTICE_PROTOCOL, userActionsProtocol: tasks.userActionsProtocol, requestAccountingProtocol: ledger.requestAccountingProtocol, acceptorReadOnly: cfg.acceptorReadOnly, userEntryReady,
+          userEntryProtocol: USER_TASK_ENTRY_PROTOCOL, moneyAccountingProtocol: ledger.moneyAccountingProtocol, routerNoticeProtocol: ROUTER_NOTICE_PROTOCOL, approvalWaitProtocol: 1, userActionsProtocol: tasks.userActionsProtocol, requestAccountingProtocol: ledger.requestAccountingProtocol, acceptorReadOnly: cfg.acceptorReadOnly, userEntryReady,
           stallThresholdMs: cfg.stallThresholdMs, watchdogIntervalMs: cfg.watchdogIntervalMs,
           pid: process.pid, bootAt: Math.round((Date.now() - process.uptime() * 1000) / 1000), instanceId }),
         getTaskSessions: (taskId: string) => structuredClone(tasks.getSessions(taskId)),
@@ -967,6 +972,10 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
       const onSessionEvent = (session: { id: string }, event: SessionEvent) => {
         const record = tasks.findSessionBySessionId(session.id);
         if (!record) return; // 无关会话：不处理
+        if (event.type === "approval/asked" || event.type === "approval/decided" || event.type === "turn/end") {
+          void approvalWaits.observe(record, event).catch(error => ctx.logger.warn(`longtask: 审批等待登记失败：${String(error)}`));
+          if (event.type.startsWith("approval/")) return;
+        }
         if (event.type === "turn/end") endedTurns.add(record.sessionId);
         else if (event.type === "turn/start") endedTurns.delete(record.sessionId);
         let eventUsage: Partial<NonNullable<SessionEvent["data"]["usage"]>> | undefined = event.data.usage;

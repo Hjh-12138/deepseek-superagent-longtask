@@ -2878,6 +2878,49 @@ test("截断等待专家回复：保持定向等待，不暂停或催跑Worker",
   }finally{for(const stop of fake.teardowns)await stop();}
 });
 
+test("Worker审批生命周期：轮次未结束即登记等待，决定后不代批、不重复续做",async()=>{
+  const {fake,api,taskId,worker}=await makeMoneyApp("60");try{
+    const before=structuredClone(api.getBudget(taskId));
+    for(const outcome of ["allowed-once","rejected","cancelled","unavailable"]){
+      const id="approval-"+outcome;
+      const asked={type:"approval/asked",data:{id,toolName:"pwsh",callId:"call-"+id,reason:"需要用户确认此工具操作"}};
+      fake.emitSessionEvent(worker.id,asked);fake.emitSessionEvent(worker.id,structuredClone(asked));
+      for(let n=0;n<8;n++)await fake.flush();
+      assert.equal(api.listWaits(taskId).filter(w=>w.status==="waiting").length,1,"approval/asked 应在 turn/end 前登记可靠等待");
+      const evidence=api.getTaskEvidence(taskId),pending=Object.values(evidence.collections.taskApprovals??{}) as any[];
+      assert.equal(pending.filter(a=>a.status==="pending").length,1);
+      assert.equal((api.getTask(taskId) as any).waitingOn.kind,"user_approval");
+      fake.emitSessionEvent(worker.id,{type:"approval/decided",data:{id,outcome}});
+      await fake.waitFor(()=>api.listWaits(taskId).every(w=>w.status!=="waiting"));
+      fake.emitSessionEvent(worker.id,{type:"approval/decided",data:{id,outcome}});await fake.flush();
+      assert.equal(api.getTask(taskId)!.status,"active");assert.equal(worker.messages.length,1);assert.equal(worker.stopped,false);
+      assert.deepEqual(api.getBudget(taskId),before,"审批状态不修改账本");
+    }
+    fake.emitSessionEvent(worker.id,{type:"approval/asked",data:{id:"unfinished",toolName:"pwsh"}});
+    await fake.waitFor(()=>api.listWaits(taskId).some(w=>w.status==="waiting"));
+    fake.emitSessionEvent(worker.id,{type:"turn/end",data:{turn:1,reason:{kind:"aborted"}}});
+    await fake.waitFor(()=>api.listWaits(taskId).every(w=>w.status!=="waiting"));
+    assert.equal((Object.values(api.getTaskEvidence(taskId).collections.taskApprovals??{}) as any[]).find(a=>a.requestId==="unfinished")?.status,"expired");
+  }finally{for(const stop of fake.teardowns)await stop();}
+});
+
+test("审批等待重载：原审批失效并暂停核对，不自动重建Worker或追加预算",async()=>{
+  const first=await makeMoneyApp("60");let second:ReturnType<typeof makeFakeHost>|undefined;
+  try{
+    first.fake.emitSessionEvent(first.worker.id,{type:"approval/asked",data:{id:"before-reload",toolName:"pwsh",reason:"需要用户批准"}});
+    await first.fake.waitFor(()=>first.api.listWaits(first.taskId).some(w=>w.status==="waiting"));
+    const before=structuredClone(first.api.getBudget(first.taskId));
+    for(const stop of first.fake.teardowns.splice(0))await stop();
+    second=makeFakeHost();apply(second.ctx,{dataDir:first.dir,agencyAgentsRoot:join(first.dir,"experts"),probeOnStart:false,watchdogIntervalMs:3600000});
+    await second.waitFor(()=>Boolean(second!.provided.get("longtask")));
+    const api=second.provided.get("longtask") as LongtaskApi;
+    assert.equal(api.getTask(first.taskId)!.status,"paused");assert.equal(api.getTask(first.taskId)!.pauseReason,"missing_input");
+    assert.deepEqual(api.getBudget(first.taskId),before);assert.equal(second.agentsById.size,0);
+    assert.ok(api.listWaits(first.taskId).every(w=>w.status!=="waiting"));
+    assert.equal((Object.values(api.getTaskEvidence(first.taskId).collections.taskApprovals??{}) as any[])[0]!.outcome,"runtime-reloaded");
+  }finally{for(const stop of first.fake.teardowns)await stop();if(second)for(const stop of second.teardowns)await stop();}
+});
+
 test("请求配置等待期间取消：金额不预留、不收费，也不恢复已取消任务",async()=>{
   const {fake,api,taskId,worker}=await makeMoneyApp();try{
     await fake.emitPreStep(worker.id);let release!:(v:Record<string,unknown>)=>void;

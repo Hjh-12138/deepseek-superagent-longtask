@@ -189,7 +189,7 @@ export class Watchdog {
   /** 对所有活跃任务跑一轮检查，返回应执行的动作 */
   checkAll(): Array<{ task: Task; action: WatchdogAction }> {
     const out: Array<{ task: Task; action: WatchdogAction }> = [];
-    const waits = this.store.list<{ taskId: string; taskVersion?: number; status: string; description: string; wakeCondition: string | null }>("taskWaits");
+    const waits = this.store.list<{ taskId: string; taskVersion?: number; status: string; description: string; wakeCondition: string | null; kind?: string; observed?: boolean; executorRelPath?: string }>("taskWaits");
     for (const task of this.store.list<Task>(COLLECTION_TASKS)) {
       if (task.status !== "active" && task.status !== "rework") continue;
       const active = waits.filter((w) => w.taskId === task.id && w.status === "waiting" &&
@@ -197,10 +197,10 @@ export class Watchdog {
       // 只有"全部执行者都有可靠外部等待"才整体免催：一位下游等待不能屏蔽上游停滞（审查 C8）
       const executors = (task.versions[task.currentVersion]?.executors ?? []).map((e) => e.relPath);
       const waitingExecutors = new Set(
-        active
+        [...active.filter(w => w.kind === "user_approval" && w.observed && w.executorRelPath).map(w => w.executorRelPath!), ...active
           .map((w) => w.wakeCondition)
           .filter((c): c is string => /^(dependency|executor-reply|job):/.test(c ?? ""))
-          .map((c) => c.split(":")[1] ?? ""),
+          .map((c) => c.split(":")[1] ?? "")],
       );
       const allBlocked = executors.length > 0 && executors.every((rel) => waitingExecutors.has(rel));
       const action = watchdogDecision(
