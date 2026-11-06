@@ -1,0 +1,17 @@
+{
+  "name": "dsh-longtask-e2e",
+  "description": "阶段1/2/3/4显式联调驱动：任务链、专家交接、生命周期及实机验收证据",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+# 阶段 1/2/3/4 联调驱动；只消费显式命令，不随插件启用自动开工。
+- insert:
+    - id: longtask-e2e
+      name: dsh-longtask-e2e
+      config:
+        taskBudgetTokens: 600000
+        timeoutMs: 1500000
+        pollIntervalMs: 3000
+        autoConfirm: true
+        autoRun: false

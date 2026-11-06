@@ -1,0 +1,30 @@
+# 这是longtask实例的config示例，不是可单独导入的第二个bundle。
+# 把存在的绝对路径填好，再通过DSH宿主修改已安装longtask实例配置。
+dataDir: "D:/DSHData/longtask"
+agencyAgentsRoot: "D:/Agents/agency-agents"
+workerCwd: "D:/Work/my-project"
+workerProvider: "deepseek-official"
+workerModel: "deepseek-flash"
+workerMaxTokens: 8000
+workerParentAgent: "auto"
+workerPreset: "standard"
+acceptorReadOnly: true
+maxConcurrentTasks: 2
+probeOnStart: true
+
+# 首版内置下列官方Flash高峰价，按保守费用核算，不是平台实扣。
+# modelPrices数组会覆盖内置表；配置其他模型时必须填真实路由和核对过的价格。
+# 每个价格单位都是人民币元/百万Token，必须使用字符串。
+# 到期后请求会暂停；依据官方价格更新表和expiresAt，不要仅延长过期时间。
+modelPrices:
+  - provider: "deepseek-official"
+    model: "deepseek-flash"
+    currency: "CNY"
+    input: "2"
+    cacheRead: "0.04"
+    cacheWrite: "2"
+    output: "8"
+    source: "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"
+    verifiedAt: "2026-11-05T17:20:00Z"
+    expiresAt: "2026-12-06T00:00:00+08:00"
+    basis: "conservative-ceiling"

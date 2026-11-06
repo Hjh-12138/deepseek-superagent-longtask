@@ -1,0 +1,21 @@
+# 正式核心bundle：不加载E2E，不携带开发者数据目录。
+# dataDir默认~/.dsh/longtask；专家库和工作目录请按RELEASE.md配置。
+- insert:
+    - id: longtask
+      name: dsh-plugin-longtask
+      config:
+        probeOnStart: true
+        probeInitialDelayMs: 8000
+        probeRetryDelayMs: 5000
+        probeMaxAttempts: 4
+        watchdogIntervalMs: 60000
+        stallThresholdMs: 900000
+        # Worker/验收会话：不指定模型时宿主不会启动轮次（真机实测）
+        workerProvider: "deepseek-official"
+        workerModel: "deepseek-flash"
+        workerMaxTokens: 8000
+        # auto = Worker 会话挂到首个用户会话下，尝试继承发起方凭证上下文
+        workerParentAgent: "auto"
+        # 能力集：standard 含文件写入/命令执行工具；留空则只有全局工具
+        workerPreset: "standard"
+        acceptorReadOnly: true

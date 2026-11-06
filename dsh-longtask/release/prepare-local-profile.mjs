@@ -1,0 +1,26 @@
+/** 只生成可审阅的本机profile候选文件；不改正在使用的profile，不安装/卸载或启动DSH。 */
+import {readFileSync,writeFileSync,mkdirSync,existsSync,statSync} from 'node:fs';
+import {join,resolve,isAbsolute} from 'node:path';
+import {homedir} from 'node:os';
+import {createHash} from 'node:crypto';
+const root=resolve(import.meta.dirname,'..'),out=join(root,'release/artifacts'),profile=join(homedir(),'.dsh/profiles/desktop');
+const [experts,workspace]=process.argv.slice(2);
+if(!experts||!workspace||![experts,workspace].every(p=>isAbsolute(p)&&statSync(p,{throwIfNoEntry:false})?.isDirectory())||!existsSync(join(experts,'divisions.json')))throw Error('用法：node release/prepare-local-profile.mjs <存在的专家库绝对路径> <存在的工作区绝对路径>');
+const version=JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version;
+const archive=join(out,`dsh-plugin-longtask-${version}.tgz`);if(!existsSync(archive))throw Error('请先构建最终候选tgz');
+const files=[join(profile,'package.json'),join(profile,'cordis.patch.yml')],hash=p=>createHash('sha256').update(readFileSync(p)).digest('hex');
+const before=files.map(path=>({path,sha256:hash(path)}));
+const pkg=JSON.parse(readFileSync(files[0],'utf8')),patch=readFileSync(files[1],'utf8');
+if(/id:\s*["']?longtask\b/.test(patch))throw Error('已有longtask实例覆盖，请人工合并，不重复追加');
+pkg.dependencies['dsh-plugin-longtask']='file:'+archive.replaceAll('\\','/');delete pkg.dependencies['dsh-longtask-e2e'];
+pkg.dsh.profile.bundles=pkg.dsh.profile.bundles.filter(n=>n!=='dsh-longtask-e2e');
+const dataDir=join(homedir(),'.dsh/longtask-production');if(existsSync(join(dataDir,'state.json')))throw Error('候选正式库已经有状态，请先核对；不会覆盖或删除');
+const local={dataDir,agencyAgentsRoot:experts,workerCwd:workspace,workerProvider:'deepseek-official',workerModel:'deepseek-flash',workerPreset:'standard',workerParentAgent:'auto',acceptorReadOnly:true};
+const config=Object.entries(local).map(([k,v])=>'    '+k+': '+JSON.stringify(typeof v==='string'?v.replaceAll('\\','/'):v)).join('\n');
+mkdirSync(out,{recursive:true});
+writeFileSync(join(out,'desktop-profile.package.json'),JSON.stringify(pkg,null,2)+'\n');
+writeFileSync(join(out,'desktop-profile.cordis.patch.yml'),patch.trimEnd()+'\n- id: longtask\n  name: dsh-plugin-longtask\n  config:\n'+config+'\n');
+for(const f of before)if(hash(f.path)!==f.sha256)throw Error('生成期间profile变化，请重新核对');
+const result={preparedAt:new Date().toISOString(),applied:false,liveProfileUnchanged:true,archive,archiveSha256:hash(archive),config:local,profileBefore:before};
+writeFileSync(join(out,'desktop-profile.preparation.json'),JSON.stringify(result,null,2));
+console.log(JSON.stringify({prepared:true,applied:false,liveProfileUnchanged:true,output:out,dataDir}));
