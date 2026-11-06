@@ -259,6 +259,17 @@ export class TaskService {
 
   constructor(private readonly o: TaskServiceOptions) {}
 
+  /** 卸载前排空已接受的调度/任务/产物操作，包括操作中继续排队的后续动作。 */
+  async whenIdle(): Promise<void> {
+    const seen = new Set<Promise<unknown>>();
+    for (;;) {
+      const pending = [this.schedulerTail, ...this.taskLocks.values(), ...this.locationLocks.values()].filter(p=>!seen.has(p));
+      if (!pending.length) return;
+      for (const p of pending) seen.add(p);
+      await Promise.allSettled(pending);
+    }
+  }
+
   /** 进程内一次性占位：用于高频事件触发的收敛指令，防止并发同时通过"先查后写"的去重检查 */
   private readonly onceKeys = new Set<string>();
 
@@ -920,14 +931,14 @@ export class TaskService {
   }
 
   /** 因状态变化而未投递的记录（落盘留痕，delivery=failed，不参与恢复重投） */
-  private failedRecord(
+  private async failedRecord(
     taskId: string,
     relPath: string,
     dedupeKey: string,
     content: string,
     reservationId: string,
     reason: string,
-  ): MessageRecord {
+  ): Promise<MessageRecord> {
     const record: MessageRecord = {
       id: newId("msg"),
       taskId,
@@ -942,7 +953,7 @@ export class TaskService {
       createdAt: this.now().toISOString(),
       deliveredAt: null,
     };
-    void this.o.store.transact((data) => {
+    await this.o.store.transact((data) => {
       (data.collections[COLLECTION_MESSAGES] ??= {})[record.id] = { ...record, reservationId };
     });
     return record;

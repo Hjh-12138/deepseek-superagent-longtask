@@ -2921,6 +2921,18 @@ test("审批等待重载：原审批失效并暂停核对，不自动重建Worke
   }finally{for(const stop of first.fake.teardowns)await stop();if(second)for(const stop of second.teardowns)await stop();}
 });
 
+test("卸载排空：用量刚回传即卸载，异步结算与收尾须在关库前完成",async()=>{
+  const {fake,api,taskId,worker}=await makeMoneyApp("60",{wrapUpAtBudgetRatio:0.00001,wrapUpMinStepsLeft:0});
+  try{
+    await fake.emitPreStep(worker.id);await fake.emitRequest(worker.id,moneyRoute);
+    fake.emitSessionEvent(worker.id,{seq:9400,...assistantUsageEvent(1,{inputTokens:1000,outputTokens:1000,cacheReadTokens:0,cacheWriteTokens:0})});
+    for(const stop of fake.teardowns.splice(0))await stop();
+    assert.equal(api.getMoneyBudget(taskId)!.calculatedAmount,"0.01");assert.equal(api.getMoneyBudget(taskId)!.reservedAmount,"0");
+    assert.ok(!fake.logs.some(l=>l.includes("store 已关闭")),"不能在存储关闭后继续结算或派发收尾");
+    assert.ok(Object.values(api.getTaskEvidence(taskId).events).some((e:any)=>e.type==="task.wrap_up_requested"));
+  }finally{for(const stop of fake.teardowns)await stop();}
+});
+
 test("请求配置等待期间取消：金额不预留、不收费，也不恢复已取消任务",async()=>{
   const {fake,api,taskId,worker}=await makeMoneyApp();try{
     await fake.emitPreStep(worker.id);let release!:(v:Record<string,unknown>)=>void;

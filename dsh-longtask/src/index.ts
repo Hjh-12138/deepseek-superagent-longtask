@@ -1666,7 +1666,18 @@ export function apply(ctx: HostContext, options: Partial<LongtaskConfig> = {}): 
       });
       diag("stage:ready-complete");
 
-      disposers.push(() => store.close());
+      disposers.push(async () => {
+        // 监听器和计时器已注销；结算/收尾的异步后续仍可能提交事务，先排空再关库。
+        const seen = new Set<Promise<unknown>>();
+        for (;;) {
+          const pending = [...reserveInFlight.values(), ...settlementInFlight.values(), ...artifactWritesInFlight.values()].filter(p=>!seen.has(p));
+          if (!pending.length) break;
+          for (const p of pending) seen.add(p);
+          await Promise.allSettled(pending);
+        }
+        await tasks.whenIdle();
+        await store.close();
+      });
       disposers.push(() => host.disposeAll());
     })().catch((error) => {
       diag(`INIT-ERROR ${String((error as Error)?.stack ?? error)}`);
