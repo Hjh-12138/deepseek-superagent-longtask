@@ -191,6 +191,26 @@ function businessDependencyInput(directory:string){
     return {a,b,files,input};
 }
 
+test("依赖模块返工后重新交接，补测升版保留未退回模块进度",async()=>{
+  let batchId="a1";
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:batchId,activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);await f.svc.confirm(t.id);
+    const finish=async(owner:string,id:string,file:string,hash:string,turn:string)=>{batchId=id;await f.svc.registerArtifact(t.id,file,hash.repeat(64),owner);await f.svc.onTurnEnd(t.id,owner,"completed",turn)};
+    const verdict=async(gaps:string[])=>{const round=f.svc.latestPendingRound(t.id)!;const v=f.svc.currentVersion(f.svc.getTask(t.id)!);return f.svc.recordVerdicts(t.id,v.criteria.map(c=>({criterionId:c.id,outcome:gaps.includes(c.id)?"gap":"pass",gap:gaps.includes(c.id)?"修复缺项":null,evidence:"核对产物",criteriaVersion:v.version,artifactHashes:round.artifactHashes,verdictBy:v.acceptor.relPath,createdAt:new Date().toISOString()})),round.artifactHashes,round.roundId)};
+    await finish(a.relPath,"a1",files[0]!,"a","a1");await finish(b.relPath,"b1",files[1]!,"b","b1");await finish(a.relPath,"a2",files[2]!,"c","a2");
+    assert.equal(await verdict(["backend","tests"]),"rework");
+    const worker=[...f.sessions.values()].find(s=>s.key.includes(b.relPath))!,before=worker.deliveries.length;
+    await finish(a.relPath,"a1",files[0]!,"d","ra1");assert.equal(worker.deliveries.length,before+1,"前置返工完成后必须唤醒下游返工");
+    await finish(b.relPath,"b1",files[1]!,"e","rb1");await finish(a.relPath,"a2",files[2]!,"f","ra2");assert.equal(await verdict([]),"delivered");
+    await f.svc.configureVerification(t.id,{workspace:f.directory,checks:[{id:"check",kind:"command",criterionIds:["backend"],purpose:"核验",program:"node",args:["check.js"],timeoutMs:1000}]},1);
+    assert.deepEqual(f.svc.getBatchProgress(t.id).find(p=>p.relPath===b.relPath)!.completed,["b1"]);
+    assert.equal(await verdict(["backend"]),"rework");
+    await finish(a.relPath,"a1",files[0]!,"1","va1");await finish(a.relPath,"a2",files[2]!,"2","va2");
+    assert.equal(f.svc.getTask(t.id)!.status,"awaiting_acceptance");
+  }finally{await f.store.close();}
+});
+
 test("业务依赖按当前批次调度：A首批→B→A后批，恢复保留等待且重放不重复唤醒",async()=>{
   let batchId="a1";
   const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:batchId,activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});

@@ -14,7 +14,7 @@ import {DELIVERY_EVIDENCE,DeliveryEvidenceExporter,exportDeliveryEvidence,queueD
 
 const execute=promisify(execFile),sha=(s:string)=>createHash("sha256").update(s).digest("hex");
 const expert=(relPath:string)=>({relPath,division:"d",name:relPath,intro:"",contentHash:"h",snapshottedAt:new Date().toISOString()});
-async function fixture(){
+async function fixture(overlap=false){
   const parent=resolve(".longtask/verification");await fs.mkdir(parent,{recursive:true});const dir=await fs.mkdtemp(join(parent,"verify-test-")),project=join(dir,"project");await fs.mkdir(project);
   await fs.writeFile(join(project,"app.txt"),"frozen source");
   await fs.writeFile(join(project,"check.cjs"),"const assert=require('node:assert/strict'),fs=require('node:fs');assert.equal(fs.readFileSync('app.txt','utf8'),'frozen source');fs.writeFileSync('runtime-output.txt','actual side effect in copy');console.log('REAL_CHECK_PASSED');");
@@ -34,7 +34,7 @@ async function fixture(){
   }}}};
   const services=new Map<string,any>([["shell",shell],["tools",{register:(d:any)=>{definition=d;return()=>{}}}]]);
   const ctx:any={get:(name:string)=>services.get(name),logger:{warn(){},info(){},error(){}}};
-  const tool=registerVerificationTool({ctx,store,tasks:svc,workspace:dir,dataDir:join(dir,"reports"),blocked:()=>false});
+  const tool=registerVerificationTool({ctx,store,tasks:svc,workspace:dir,dataDir:overlap?join(project,"runtime-data"):join(dir,"reports"),blocked:()=>false});
   const lease=svc.getSessions(t.id).find(s=>s.role==="acceptor")!,agent={session:{id:lease.sessionId}};
   const call=(args:any={checkId:"api"},caller=agent)=>definition.execute(args,{agent:caller,signal:new AbortController().signal});
   const verdict=(ids?:string[]):Verdict=>({criterionId:"c1",outcome:"pass",evidence:"已读源码和测试文件",gap:null,criteriaVersion:svc.currentVersion(svc.getTask(t.id)!).version,artifactHashes:svc.latestPendingRound(t.id)!.artifactHashes,verdictBy:"review.md",createdAt:new Date().toISOString(),...(ids?{verificationRunIds:ids}:{})});
@@ -47,6 +47,10 @@ test("实测要求不能被review降级；命令与浏览器检查分别覆盖",
   assert.deepEqual(verificationMethods({id:"doc",text:"README包含接口概览"}),["review"]);
   assert.deepEqual(verificationMethods({id:"doc",text:"产物 C:\\workspace\\e2e\\result.md 与模板一致"}),["review"]);
   assert.ok(validateVerificationPlan({criteria:[{id:"c",text:"功能符合要求"}],verificationPolicyVersion:1}).some(e=>e.includes("明确verification")));
+});
+
+test("验证项目与插件数据目录重叠时拒绝执行，不产生错误通过证据",async()=>{
+  const f=await fixture(true);try{await assert.rejects(()=>f.call(),/数据目录与验证项目目录重叠/);assert.equal(f.calls,0);assert.equal(f.store.list(VERIFICATION_RUNS).length,0);}finally{await f.close();}
 });
 
 const documentCriteria=[

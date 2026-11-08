@@ -2055,6 +2055,7 @@ export class TaskService {
     });
 
     if (!allPass) {
+      await this.recordDependencyWaits(taskId);
       const gaps = verdicts.filter((v) => v.outcome === "gap");
       // 归属：交回提交该轮的执行者；他已被换下时才回落到第一位执行者
       const submitter = round.submittedBy;
@@ -2424,6 +2425,15 @@ export class TaskService {
         const t=data.collections[COLLECTION_TASKS]?.[taskId] as Task;
         if(!t||this.currentVersion(t).version!==expectedVersion||!(t.status==="delivered"||(t.status==="paused"&&t.pauseReason==="missing_input")))throw Error("补测审批期间任务状态或版本已变化");
         const v={...structuredClone(preview),version:expectedVersion+1,confirmedAt:this.now().toISOString()};
+        if(v.executionPlanVersion)for(const a of v.assignments??[]){
+          const batches=a.batches??[];if(!batches.length)continue;
+          const oldKey=`${taskId}:v${expectedVersion}:${a.relPath}`,newKey=`${taskId}:v${v.version}:${a.relPath}`;
+          const saved=(data.collections.batchProgress?.[oldKey] as {completed:string[]}|undefined)?.completed;
+          const events=data.eventOrder.map(id=>data.events[id] as {taskId?:string;taskVersion?:number;type?:string;payload?:{relPath?:string;batchId?:string}}).filter(e=>e?.taskId===taskId&&e.taskVersion===expectedVersion&&e.type==="task.batch_completed"&&e.payload?.relPath===a.relPath).map(e=>e.payload!.batchId);
+          const completed=saved??events;
+          if(!Array.isArray(completed)||completed.some((id,i)=>batches[i]?.id!==id)||((t.status==="delivered"||t.resumeStatus==="awaiting_acceptance")&&completed.length!==batches.length))throw Error(`无法证明 ${a.relPath} 的历史批次进度，请先核对检查点后补测`);
+          (data.collections.batchProgress??={})[newKey]={completed:[...completed]};
+        }
         t.versions.push(v);t.currentVersion=t.versions.length-1;t.status="paused";t.pauseReason="queued";t.resumeStatus="awaiting_acceptance";t.updatedAt=this.now().toISOString();
         for(const r of Object.values(data.collections[COLLECTION_ROUNDS]??{}) as AcceptanceRound[])if(r.taskId===taskId&&r.state==="pending")r.state="voided";
         data.appendEvent({eventId:newId("evt"),taskId,taskVersion:v.version,source:"user",type:"task.reopened",payload:{verificationOnly:true,fromVersion:expectedVersion,reason:revision.reason??"补齐实测计划",criteriaChanges:revision.criteria?.map(c=>({id:c.id,before:this.currentVersion(original).criteria.find(p=>p.id===c.id),after:v.criteria.find(p=>p.id===c.id)}))??[],scope:v.verificationScope??null},createdAt:t.updatedAt,dedupeKey:`verify-plan:${taskId}:v${v.version}`});

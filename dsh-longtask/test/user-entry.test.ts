@@ -89,6 +89,7 @@ test("纯文档正式提案：技术说明不触发开发模块校验，也不�
 });
 
 test("真实SDK正式工具链：声明实测、只读验收调用专用工具、引用运行记录交付与原预算补测",async()=>{
+  mkdirSync(join(process.cwd(),'.longtask','verification'),{recursive:true});
   const source=mkdtempSync(join(process.cwd(),'.longtask','verification','entry-verify-')),file=join(source,'artifact.txt');writeFileSync(file,'frozen');
   const f=await fixture({workerCwd:source,acceptorReadOnly:true});try{
     f.tools.register({name:'read',description:'read',parameters:{type:'object',properties:{}},output:{schema:{type:'string'},render:()=>[]},execute:async()=>"frozen"});

@@ -1,6 +1,6 @@
 import {createHash, randomUUID} from "node:crypto";
 import {promises as fs} from "node:fs";
-import {isAbsolute, join, relative, resolve, sep} from "node:path";
+import {dirname, isAbsolute, join, relative, resolve, sep} from "node:path";
 import {tmpdir} from "node:os";
 import type {Criterion, TaskVersion, VerificationPlan, Verdict} from "./types.js";
 import type {Store} from "./store/store.js";
@@ -134,6 +134,10 @@ export function verificationCapabilityIssue(ctx:HostContext):string|undefined {
   return !shell?.sandboxMode||typeof shell.resolve!=="function"||typeof shell.execute!=="function" ? "受控实测需要宿主具备沙箱shell服务；不会降级为无沙箱执行或静态通过" : undefined;
 }
 const within=(root:string,path:string)=>{const rel=relative(root,path);return rel===""||(!rel.startsWith(`..${sep}`)&&rel!==".."&&!isAbsolute(rel));};
+async function physicalPath(path:string):Promise<string>{
+  const target=resolve(path);let parent=target;
+  for(;;){try{return resolve(await fs.realpath(parent),relative(parent,target));}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;const next=dirname(parent);if(next===parent)throw error;parent=next;}}
+}
 const quote=(s:string)=>process.platform==="win32"?`'${s.replaceAll("'","''")}'`:`'${s.replaceAll("'",`'"'"'`)}'`;
 export function verificationCommand(check:VerificationPlan["checks"][number]):string {
   const argv=[check.program,...check.args].map(quote).join(" ");
@@ -160,6 +164,7 @@ export function registerVerificationTool(o:{ctx:HostContext;store:Store;tasks:Ta
       const run=(async()=>{
         live();const errors=validateVerificationPlan(v);if(errors.length)throw Error(errors.join("；"));
         const workspace=await fs.realpath(o.workspace),source=await fs.realpath(plan.workspace);if(!within(workspace,source))throw Error("验证项目目录须位于任务工作目录内");
+        const dataDir=await physicalPath(o.dataDir);if(within(source,dataDir)||within(dataDir,source))throw Error("插件数据目录与验证项目目录重叠；请先将数据目录迁移到项目之外，未执行检查");
         // 宿主workspace-write还授予平台临时目录写入权，原项目位于该目录时不能声称源码受保护。
         if(process.platform!=="win32"&&(within(await fs.realpath(tmpdir()),source)||within("/tmp",source)))throw Error("原项目位于宿主沙箱默认可写临时目录，无法保证源码只读；请使用临时目录之外的项目路径");
         const scratch=await fs.mkdtemp(join(tmpdir(),"dsh-verify-"));let snapshot=join(scratch,"project");
