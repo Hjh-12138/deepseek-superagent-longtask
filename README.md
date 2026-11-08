@@ -1,6 +1,6 @@
-# DSH Longtask
+# DeepSeek Super Agent Longtask
 
-DSH 通用长任务插件：在用户确认目标、完成标准、专家分工和预算后，持续执行、等待协作、恢复任务并完成独立验收。
+基于 DeepSeek 团队发布的 Super Agent 架构开发的 DSH 通用长任务插件：在用户确认目标、完成标准、专家分工和预算后，持续执行、等待协作、恢复任务并完成独立验收。
 
 当前核心版本：`0.1.2-rc.19`，仍为发布候选版。宿主兼容验证覆盖 DSH SDK `0.2.1-rc.5` 和 `0.2.2-rc.1`。金额账本按请求用量和价格表估算费用；它不是平台实扣账单。
 
@@ -21,8 +21,8 @@ rc.19包含实测行为识别与业务模块依赖调度修复，见[更新记�
 建议使用 Node.js 24 和 npm。
 
 ```sh
-git clone https://github.com/Hjh-12138/dsh-longtask.git
-cd dsh-longtask/dsh-longtask
+git clone https://github.com/Hjh-12138/deepseek-superagent-longtask.git
+cd deepseek-superagent-longtask/dsh-longtask
 npm ci --ignore-scripts
 npm test
 ```
