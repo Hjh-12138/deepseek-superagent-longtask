@@ -1,0 +1,27 @@
+name: Core plugin checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: dsh-longtask
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: dsh-longtask/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm pack --dry-run

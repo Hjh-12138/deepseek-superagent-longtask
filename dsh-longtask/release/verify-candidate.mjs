@@ -7,7 +7,7 @@ import {execFileSync} from 'node:child_process';
 import assert from 'node:assert/strict';
 
 const root=resolve(import.meta.dirname,'..'),pkg=JSON.parse(readFileSync(join(root,'package.json'),'utf8'));
-const evidence=join(root,'.longtask','verification',`release-${pkg.version}`);
+const evidence=process.argv[2]?resolve(process.argv[2]):join(root,'.longtask','verification',`release-${pkg.version}`);
 mkdirSync(evidence,{recursive:true});
 const manifest=JSON.parse(readFileSync(join(evidence,'pack.json'),'utf8').replace(/^\uFEFF/,''))[0];
 assert.equal(manifest.version,pkg.version);
@@ -22,6 +22,15 @@ for(const f of manifest.files){
 }
 const fromPackage=createRequire(join(sandbox,'entry.cjs')),entry=fromPackage(pkg.name);
 assert.equal(typeof entry.apply,'function');assert.equal(entry.name,'longtask');assert.equal(entry.defaultConfig.modelPrices[0].currency,'CNY');
+assert.equal(entry.defaultConfig.workerMaxTokens,'host');
+assert.equal(entry.defaultConfig.executorMaxSteps,0);
+assert.equal(entry.defaultConfig.acceptorMaxSteps,0);
+assert.equal(entry.defaultConfig.acceptorProgressWindowSteps,8);
+assert.equal(entry.defaultConfig.acceptorMaxIdleSteps,3);
+assert.equal(entry.defaultConfig.toolReadBudget,0);
+assert.equal(entry.defaultConfig.acceptanceReadBudgetBytes,65536);
+assert.equal(entry.defaultConfig.backgroundJobTimeoutMs,7200000);
+assert.deepEqual(entry.defaultConfig.acceptorReadTools,[]);
 assert.equal(fromPackage(pkg.name+'/package.json').version,pkg.version);
 const dataDir=join(sandbox,'synthetic-data');mkdirSync(dataDir);
 const state={collections:{tasks:{t:{id:'t',status:'paused',pauseReason:'budget',currentVersion:0,versions:[{version:1,goal:'金额诊断验证',criteria:[],deliverables:[]}]}},

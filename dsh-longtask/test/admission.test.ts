@@ -89,9 +89,18 @@ test("严格模式的可信上界判据：未声明基线时首轮不可信", ()
 test("准入成本 = 输入上界 + 输出上限；归一化允许显式声明 0 基线", () => {
   const bound = boundRequestInput(POLICY, { lastInputTokens: 10_000, lastOutputTokens: 500, inboundChars: 0 });
   assert.equal(requestCostFor(bound, POLICY), 10_500 + POLICY.maxOutputTokens);
-  assert.equal(requestAdmissionCost(DEFAULT_ADMISSION, 10_000), Math.ceil(10_000 * 1.25) + 8000);
+  assert.equal(requestAdmissionCost(DEFAULT_ADMISSION, 10_000), Math.ceil(10_000 * 1.25) + 16000);
 
   assert.equal(normalizeAdmission({ baselineInputTokens: 0 }).baselineInputTokens, 0, "0 表示不声明基线，不能被静默替换成默认值");
+  assert.equal(normalizeAdmission({ maxOutputTokens: 0 }).maxOutputTokens, 0, "宿主模式前置规划保持未知输出，不能偷换成固定上限");
   assert.equal(normalizeAdmission({ baselineInputTokens: Number.NaN }).baselineInputTokens, DEFAULT_ADMISSION.baselineInputTokens);
   assert.equal(normalizeAdmission({ inputSafetyFactor: 0.5 }).inputSafetyFactor, DEFAULT_ADMISSION.inputSafetyFactor, "系数不得小于 1");
+});
+
+test("验收大产物按有限读取计划预留，并保持输入输出分项",()=>{
+  const input={requestBytes:6000,artifactBytes:1024*1024,artifactCount:1,unknownArtifacts:0,minimumTokens:26000};
+  const a=planAcceptance(POLICY,input),b=planAcceptance(POLICY,{...input,artifactBytes:1024*1024*1024});
+  assert.equal(a.tokens,b.tokens);assert.equal(a.plannedReadBytes,65536);
+  assert.equal(a.tokens,a.inputTokens+a.outputTokens+a.untypedTokens);
+  assert.ok(planAcceptance(POLICY,{...input,readBudgetBytes:131072}).tokens>a.tokens);
 });

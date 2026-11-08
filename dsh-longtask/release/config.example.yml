@@ -5,10 +5,19 @@ agencyAgentsRoot: "D:/Agents/agency-agents"
 workerCwd: "D:/Work/my-project"
 workerProvider: "deepseek-official"
 workerModel: "deepseek-flash"
-workerMaxTokens: 8000
+workerMaxTokens: "host" # 跟随DSH最终请求上限，按该值预留Token和金额
 workerParentAgent: "auto"
 workerPreset: "standard"
 acceptorReadOnly: true
+acceptorReadTools: [] # 仅填写宿主已提供、经确认只读的联网/预览/隔离核对工具，禁止写入及任意shell。
+toolReadBudget: 0 # 0关闭固定次数提醒；正数仅提醒当前Worker，不禁止必要读取。
+acceptanceReadBudgetBytes: 65536 # 未来验收首轮读取规划，不是实际模型请求的预算豁免。
+backgroundJobTimeoutMs: 7200000 # 已登记宿主命令的有限等待窗口；超时仍需纠偏。
+executorMaxSteps: 0 # 默认不设累计步数硬上限；正整数可显式启用。
+acceptorMaxSteps: 0 # 验收默认按实际进展与原预算继续；正数才启用固定硬上限。
+acceptorProgressWindowSteps: 8 # 检查点间隔，有新核对证据则继续。
+acceptorMaxIdleSteps: 3 # 无新证据先纠偏，再经过同等无进展窗口则暂停。
+acceptorToolWaitMs: 15000 # 首步前等待读取工具，期间不调用模型。
 maxConcurrentTasks: 2
 probeOnStart: true
 

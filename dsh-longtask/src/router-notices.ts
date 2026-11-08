@@ -3,22 +3,27 @@ import type {HostContext} from "./host-types.js";
 import type {Store} from "./store/store.js";
 import type {Task, EventEnvelope, TaskBudgetState, MessageRecord} from "./types.js";
 import {formatCny} from "./ledger/money.js";
+import {pendingApprovals, type TaskApproval} from "./approval-waits.js";
 
 declare module "@deepseek-ai/dsh-llm" {
-  interface MessageSourceMap {"longtask-status": {kind: "longtask-status"; form: "notice"; summary: string; taskId: string; eventId: string}}
+  interface MessageSourceMap {"longtask-status": {kind: "longtask-status"; form: "notice"; summary: string; taskId: string; eventId: string;
+    workers?: Array<{sessionId: string; relPath: string; toolName: string; requestId: string}>}}
 }
-export const ROUTER_NOTICE_PROTOCOL = 1;
+export const ROUTER_NOTICE_PROTOCOL = 3;
 interface Notice {
   id: string; taskId: string; targetSessionId: string; eventId: string;
   taskStatus: string; pauseReason: string | null; message: UserMessage;
   delivery: "pending" | "delivered" | "superseded"; sessionSeq?: number;
+  topic?: "task" | "approval";
+  approvalKeys?: string[];
 }
 interface NoticeSession {
   id: string;
   snapshotEvents(): readonly {type: string; seq: number; data: {id?: string}}[];
   append(type: "user/message", message: UserMessage, options: {surfaceOp: "append"}): {seq: number};
 }
-const relevant = (e: EventEnvelope) => ["task.paused", "task.resumed", "task.cancelled", "task.delivered", "task.router_bound"].includes(e.type)
+const topic = (e: EventEnvelope) => e.type === "task.approval_changed" ? "approval" : "task";
+const relevant = (e: EventEnvelope) => ["task.approval_changed", "task.paused", "task.resumed", "task.cancelled", "task.delivered", "task.router_bound"].includes(e.type)
   || (e.type === "task.continue" && e.payload.cause === "output_truncated");
 
 /** Durable, summary-only status relay. Appends a visible plugin context without waking a model. */
@@ -47,8 +52,9 @@ export class RouterNotices {
 
   private async scan(): Promise<void> {
     const snapshot = this.store.snapshot(), latest = new Map<string, EventEnvelope>();
-    for (const id of snapshot.eventOrder) {const e = snapshot.events[id] as EventEnvelope; if (e && relevant(e)) latest.set(e.taskId, e);}
-    for (const [taskId, event] of latest) {
+    for (const id of snapshot.eventOrder) {const e = snapshot.events[id] as EventEnvelope; if (e && relevant(e)) latest.set(`${e.taskId}:${topic(e)}`, e);}
+    for (const event of latest.values()) {
+      const taskId = event.taskId;
       if (this.closed) return;
       const task = this.store.get<Task>("tasks", taskId);
       if (!task?.routerSessionId) continue;
@@ -61,8 +67,10 @@ export class RouterNotices {
         const notices = (data.collections.routerNotices ??= {});
         if (notices[id]) return;
         notices[id] = {id, taskId, eventId: event.eventId, targetSessionId: task.routerSessionId!, taskStatus: task.status, pauseReason: task.pauseReason,
+          topic: topic(event), ...(topic(event) === "approval" ? {approvalKeys: pendingApprovals(data, taskId).map(a => a.key).sort()} : {}),
           message: createUserMessage({content: [{type: "text", text: text ?? "此状态已过期或无需通知"}],
-            source: {kind: "longtask-status", form: "notice", summary: boundContextSummary(`${text?.split("\n")[0] ?? "长任务状态"} ${taskId} ${text?.split("\n")[3] ?? ""}`), taskId, eventId: event.eventId}}), delivery: text ? "pending" : "superseded"} satisfies Notice;
+            source: {kind: "longtask-status", form: "notice", summary: boundContextSummary(`${text?.split("\n")[0] ?? "长任务状态"} ${taskId} ${text?.split("\n").find(line => line.startsWith("原因：")) ?? ""}`), taskId, eventId: event.eventId,
+              ...(topic(event) === "approval" ? {workers: pendingApprovals(data, taskId).map(a => ({sessionId: a.sessionId, relPath: a.relPath, toolName: a.toolName, requestId: a.requestId}))} : {})}}), delivery: text ? "pending" : "superseded"} satisfies Notice;
       });
     }
     for (const n of this.store.list<Notice>("routerNotices")) {
@@ -70,8 +78,10 @@ export class RouterNotices {
       if (n.delivery !== "pending") continue;
       const task = this.store.get<Task>("tasks", n.taskId);
       const current = this.store.snapshot();
-      const currentEvent = current.eventOrder.map(id => current.events[id] as EventEnvelope).findLast(e => e?.taskId === n.taskId && relevant(e));
-      if (!task || task.routerSessionId !== n.targetSessionId || task.status !== n.taskStatus || task.pauseReason !== n.pauseReason || currentEvent?.eventId !== n.eventId) {
+      const currentEvent = current.eventOrder.map(id => current.events[id] as EventEnvelope).findLast(e => e?.taskId === n.taskId && relevant(e) && topic(e) === (n.topic ?? "task"));
+      const approvalSame = n.topic === "approval" && JSON.stringify(pendingApprovals(current, n.taskId).map(a => a.key).sort()) === JSON.stringify(n.approvalKeys ?? []);
+      const sameStatus = task?.status === n.taskStatus || (approvalSame && ["active", "rework"].includes(task?.status ?? "") && ["active", "rework"].includes(n.taskStatus));
+      if (!task || task.routerSessionId !== n.targetSessionId || !sameStatus || task.pauseReason !== n.pauseReason || currentEvent?.eventId !== n.eventId || (n.topic === "approval" && !approvalSame)) {
         await this.mark(n.id, "superseded"); continue;
       }
       const agent = this.ctx.get<{get(id: string): {session?: NoticeSession} | undefined}>("agents")?.get(n.targetSessionId);
@@ -94,7 +104,22 @@ export class RouterNotices {
   private content(task: Task, e: EventEnvelope): string | null {
     const v = task.versions[task.currentVersion]!, b = this.store.get<TaskBudgetState>("budgets", task.id);
     let state: string, why: string, next: string;
-    if (e.type === "task.continue" && ["active", "rework"].includes(task.status)) {
+    if (e.type === "task.approval_changed") {
+      const saved = this.store.snapshot(), pending = pendingApprovals(saved, task.id);
+      const last = saved.collections.taskApprovals?.[String(e.payload.approvalKey)] as TaskApproval | undefined;
+      if (!last || last.taskVersion !== v.version) return null;
+      const outcome = last.outcome === "allowed-once" ? "已批准一次" : last.outcome === "rejected" ? "已拒绝" : last.outcome === "cancelled" ? "已取消" : last.outcome === "unavailable" ? "审批通道不可用，未获授权" : "等待已失效";
+      if (pending.length) {
+        state = `等待用户审批（${pending.length}项）`;
+        why = pending.map(a => `工具 ${a.toolName}；Worker会话 ${a.sessionId}；专家 ${a.relPath}；审批 ${a.requestId}；原因：${a.reason.slice(0, 160)}`).join("\n");
+        if (last.status !== "pending") why += `\n最近处理：${last.toolName}，${outcome}。`;
+        next = "请打开上述Worker会话中的DSH审批卡片，由用户批准或拒绝；在Router发送继续不等于批准。原工具等待宿主决定，不额外派工。";
+      } else {
+        state = last.status === "resolved" && last.outcome === "allowed-once" ? "审批已通过" : last.status === "resolved" ? "审批未通过" : "审批等待已失效";
+        why = `工具 ${last.toolName}；Worker会话 ${last.sessionId}；审批 ${last.requestId}；${outcome}。`;
+        next = last.outcome === "allowed-once" ? "等待状态已更新；宿主继续处理原工具调用，任务仍受当前状态与预算约束，插件不重复发送继续。" : "请在对应Worker核对宿主决定或失效原因；如需重试，由用户处理原任务和新的审批请求，插件不会自动批准或重放工具。";
+      }
+    } else if (e.type === "task.continue" && ["active", "rework"].includes(task.status)) {
       const delivery = this.store.list<MessageRecord>("messages").findLast(m => m.taskId === task.id && m.dedupeKey === e.dedupeKey)?.delivery;
       if (delivery === "delivered") {
         state = "单次输出截断，已自动接续"; why = "触发的是单次回复长度上限，原任务原预算内的接续指令已投递，后续准入成功才会继续执行；不代表任务总预算耗尽。";

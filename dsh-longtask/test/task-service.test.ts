@@ -12,6 +12,7 @@ import {
   type SessionLease,
   type TurnContext,
   type TurnEndKind,
+  type ProposeInput,
 } from "../src/tasks/task-service.js";
 import type { Criterion, ExpertRef, Verdict } from "../src/types.js";
 import { DEFAULT_ADMISSION, requestAdmissionCost } from "../src/budget/admission.js";
@@ -20,6 +21,40 @@ const CRITERIA: Criterion[] = [
   { id: "c1", text: "交付比较表" },
   { id: "c2", text: "给出有依据的推荐" },
 ];
+
+test("补报告按Worker连续遗漏计数，同一结束事件重放不暂停，成功补报结束周期", async () => {
+  let context: TurnContext = {status:"active",reportedNextSteps:[],claimedDone:false,activeCommand:false,pendingReply:false,unhandledEvent:false};
+  const f=await makeService(async()=>context);
+  try {
+    const t=await f.svc.propose(proposedInput({limitTokens:2_000_000,strict:true}));await f.svc.confirm(t.id);
+    await f.svc.onTurnEnd(t.id,"research/a.md","completed","a-missing");
+    await f.svc.onTurnEnd(t.id,"research/a.md","completed","a-missing");
+    assert.equal(f.svc.getTask(t.id)!.status,"active","同一事件不能算第二次遗漏");
+    context={...context,reportedNextSteps:["继续实现"]};await f.svc.onTurnEnd(t.id,"research/a.md","completed","a-valid");
+    context={...context,reportedNextSteps:[]};await f.svc.onTurnEnd(t.id,"research/a.md","completed","a-next-missing");
+    await f.svc.onTurnEnd(t.id,"research/b.md","completed","b-missing");
+    assert.equal(f.svc.getTask(t.id)!.status,"active");
+    assert.equal(Object.values(f.store.snapshot().events).filter(e=>{const v=e as {taskId:string;type:string};return v.taskId===t.id&&v.type==="task.report_requested"}).length,3);
+    await f.svc.onTurnEnd(t.id,"research/b.md","completed","b-still-missing");
+    assert.equal(f.svc.getTask(t.id)!.status,"paused","同一Worker连续遗漏仍有明确出口");
+  } finally {await f.store.close();}
+});
+
+test("有真实写入的截断接续不被第三次上限误停，恢复开启新窗口", async () => {
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:false,activeCommand:false,pendingReply:false,unhandledEvent:false,canContinueTruncated:true}));
+  try {
+    const file=join(f.directory,"result.txt");
+    const t=await f.svc.propose({...proposedInput({limitTokens:2_000_000,strict:true}),deliverables:[file]});await f.svc.confirm(t.id);
+    for(let i=1;i<=4;i++){
+      await fs.writeFile(file,`substantive version ${i}`);await f.svc.noteArtifactWrite(t.id,"research/a.md",file,`write-${i}`);
+      assert.equal((await f.svc.onTurnEnd(t.id,"research/a.md","max-tokens",`progress-${i}`))?.action,"dispatch_next");
+    }
+    for(let i=1;i<=3;i++)await f.svc.onTurnEnd(t.id,"research/a.md","max-tokens",`no-progress-${i}`);
+    assert.equal(f.svc.getTask(t.id)!.status,"paused");
+    await f.svc.resume(t.id);
+    assert.equal((await f.svc.onTurnEnd(t.id,"research/a.md","max-tokens","after-resume"))?.action,"dispatch_next");
+  } finally {await f.store.close();}
+});
 
 function expert(relPath: string, name = relPath): ExpertRef {
   return { division: "research", relPath, name, intro: "", contentHash: "hash", snapshottedAt: new Date().toISOString() };
@@ -117,6 +152,7 @@ async function makeService(
   const { host, sessions, failNextDeliveries, unknownNextDeliveries } = fakeHost(extras.host);
   // 交付物路径解析：测试里声明的是相对名（"比较表"），登记产物在 E:/e2e 下
   const svc = new TaskService({
+    admission: {maxOutputTokens:8000}, // 历史账本样例保持其原始请求上限。
     store,
     ledger,
     host,
@@ -128,7 +164,7 @@ async function makeService(
     fileSize: extras.fileSize,
     verifyArtifact: extras.verifyArtifact,
   });
-  return { store, ledger, svc, sessions, failNextDeliveries, unknownNextDeliveries };
+  return { directory:dir, store, ledger, svc, sessions, failNextDeliveries, unknownNextDeliveries };
 }
 
 function proposedInput(budget = { limitTokens: 200_000, strict: true }) {
@@ -141,6 +177,197 @@ function proposedInput(budget = { limitTokens: 200_000, strict: true }) {
     budget,
   };
 }
+
+function businessDependencyInput(directory:string){
+    const a=expert("research/a.md"),b=expert("research/b.md"),files=["base.ts","validation.test.ts","final.ts"].map(n=>join(directory,n));
+    const input:ProposeInput={...proposedInput({limitTokens:2_000_000,strict:true}),goal:"开发后端系统",executionPlanVersion:2,criteria:[{id:"backend",text:"业务正确"},{id:"tests",text:"回归覆盖"}],deliverables:files,executors:[a,b],staffingRationale:"按业务依赖交替执行，独立测试后完善服务",assignments:[
+      {relPath:a.relPath,module:"服务",responsibilities:["architecture","backend"],coverageRationale:"先设计基础接口，再完成最终服务",criterionIds:["backend"],deliverables:[files[0]!,files[2]!],batches:[{id:"a1",title:"基础接口",deliverables:[files[0]!]},{id:"a2",title:"测试后完善",deliverables:[files[2]!]}]},
+      {relPath:b.relPath,module:"回归",responsibilities:["testing"],criterionIds:["tests"],deliverables:[files[1]!],batches:[{id:"b1",title:"回归检查",deliverables:[files[1]!]}]},
+    ],workModules:[
+      {id:"base",title:"基础服务",scope:"基础接口",leadRelPath:a.relPath,criterionIds:["backend"],deliverables:[files[0]!] },
+      {id:"validation",title:"业务回归",scope:"验证基础服务",leadRelPath:b.relPath,criterionIds:["tests"],deliverables:[files[1]!],dependsOn:["base"]},
+      {id:"final",title:"最终服务",scope:"根据测试完善服务",leadRelPath:a.relPath,criterionIds:["backend"],deliverables:[files[2]!],dependsOn:["validation"]},
+    ]};
+    return {a,b,files,input};
+}
+
+test("依赖模块返工后重新交接，补测升版保留未退回模块进度",async()=>{
+  let batchId="a1";
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:batchId,activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);await f.svc.confirm(t.id);
+    const finish=async(owner:string,id:string,file:string,hash:string,turn:string)=>{batchId=id;await f.svc.registerArtifact(t.id,file,hash.repeat(64),owner);await f.svc.onTurnEnd(t.id,owner,"completed",turn)};
+    const verdict=async(gaps:string[])=>{const round=f.svc.latestPendingRound(t.id)!;const v=f.svc.currentVersion(f.svc.getTask(t.id)!);return f.svc.recordVerdicts(t.id,v.criteria.map(c=>({criterionId:c.id,outcome:gaps.includes(c.id)?"gap":"pass",gap:gaps.includes(c.id)?"修复缺项":null,evidence:"核对产物",criteriaVersion:v.version,artifactHashes:round.artifactHashes,verdictBy:v.acceptor.relPath,createdAt:new Date().toISOString()})),round.artifactHashes,round.roundId)};
+    await finish(a.relPath,"a1",files[0]!,"a","a1");await finish(b.relPath,"b1",files[1]!,"b","b1");await finish(a.relPath,"a2",files[2]!,"c","a2");
+    assert.equal(await verdict(["backend","tests"]),"rework");
+    const worker=[...f.sessions.values()].find(s=>s.key.includes(b.relPath))!,before=worker.deliveries.length;
+    await finish(a.relPath,"a1",files[0]!,"d","ra1");assert.equal(worker.deliveries.length,before+1,"前置返工完成后必须唤醒下游返工");
+    await finish(b.relPath,"b1",files[1]!,"e","rb1");await finish(a.relPath,"a2",files[2]!,"f","ra2");assert.equal(await verdict([]),"delivered");
+    await f.svc.configureVerification(t.id,{workspace:f.directory,checks:[{id:"check",kind:"command",criterionIds:["backend"],purpose:"核验",program:"node",args:["check.js"],timeoutMs:1000}]},1);
+    assert.deepEqual(f.svc.getBatchProgress(t.id).find(p=>p.relPath===b.relPath)!.completed,["b1"]);
+    assert.equal(await verdict(["backend"]),"rework");
+    await finish(a.relPath,"a1",files[0]!,"1","va1");await finish(a.relPath,"a2",files[2]!,"2","va2");
+    assert.equal(f.svc.getTask(t.id)!.status,"awaiting_acceptance");
+  }finally{await f.store.close();}
+});
+
+test("业务依赖按当前批次调度：A首批→B→A后批，恢复保留等待且重放不重复唤醒",async()=>{
+  let batchId="a1";
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:batchId,activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);
+    await f.svc.confirm(t.id);
+    assert.equal(f.sessions.size,1,"B不得在基础模块完成前启动，A也不应被自己的后批依赖阻断");
+    assert.equal(f.svc.getExecutorDependency(t.id,b.relPath).state,"waiting");
+    assert.ok(f.svc.listWaits(t.id).some(w=>w.status==="waiting"&&w.wakeCondition===`dependency:${b.relPath}`));
+    (f.svc as any).o.onSubstantiveProgress=()=>f.svc.sweepStaleWaits(t.id);
+    const source=[...f.sessions.values()][0]!;
+    await f.svc.registerArtifact(t.id,files[0]!,"a".repeat(64),a.relPath);
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","a-first");
+    assert.equal(f.svc.getExecutorDependency(t.id,a.relPath).state,"waiting");
+    assert.equal(f.svc.getExecutorDependency(t.id,b.relPath).state,"ready");
+    assert.equal(source.deliveries.length,1,"A不得提前收到a2接续");
+    assert.equal(f.sessions.size,2,"B应在A首批完成时启动，无须等A全部批次结束");
+    const target=[...f.sessions.values()].find(s=>s.key.includes(b.relPath))!,before=target.deliveries.length;
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","a-first");assert.equal(target.deliveries.length,before);
+    await f.svc.pause(t.id,"user","核对持久依赖");await f.svc.resume(t.id);
+    assert.equal(source.deliveries.length,1,"恢复不能绕过仍未完成的B");
+    batchId="b1";await f.svc.registerArtifact(t.id,files[1]!,"b".repeat(64),b.relPath);await f.svc.onTurnEnd(t.id,b.relPath,"completed","b-first");
+    assert.equal(f.svc.getExecutorDependency(t.id,a.relPath).state,"ready");assert.match(source.deliveries.at(-1)!,/a2/);
+    const after=source.deliveries.length;await f.svc.onTurnEnd(t.id,b.relPath,"completed","b-first");assert.equal(source.deliveries.length,after);
+    batchId="a2";await f.svc.registerArtifact(t.id,files[2]!,"c".repeat(64),a.relPath);await f.svc.onTurnEnd(t.id,a.relPath,"completed","a-last");
+    assert.equal(f.svc.getTask(t.id)!.status,"awaiting_acceptance");
+  }finally{await f.store.close();}
+});
+
+for(const explicit of [false,true])test(`业务依赖等待所有前置，${explicit?"显式交接":"普通消息"}不能提前唤醒`,async()=>{
+  let batchId="a1";
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:batchId,activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),c=expert("research/c.md");
+    input.executors.push(c);input.assignments![0]!.deliverables=[files[0]!];input.assignments![0]!.batches!.pop();
+    input.assignments![1]!.responsibilities=["backend"];input.assignments![1]!.criterionIds=["backend"];
+    input.assignments!.push({relPath:c.relPath,module:"独立回归",responsibilities:["testing"],criterionIds:["tests"],deliverables:[files[2]!],batches:[{id:"c1",title:"合并验证",deliverables:[files[2]!]}],...(explicit?{waitFor:{fromRelPath:a.relPath,artifactRefs:[files[0]!]}}:{})});
+    input.workModules![1]!.criterionIds=["backend"];input.workModules![1]!.dependsOn=[];
+    input.workModules![2]!.leadRelPath=c.relPath;input.workModules![2]!.criterionIds=["tests"];input.workModules![2]!.dependsOn=["base","validation"];
+    const t=await f.svc.propose(input);await f.svc.confirm(t.id);assert.equal(f.sessions.size,2);
+    await f.svc.registerArtifact(t.id,files[0]!,"a".repeat(64),a.relPath);await f.svc.onTurnEnd(t.id,a.relPath,"completed","a");
+    assert.equal(f.svc.getExecutorDependency(t.id,c.relPath).state,"waiting");
+    if(!explicit){const premature=await f.svc.sendExpertMessage(t.id,a.relPath,c.relPath,"先开始",{artifactRefs:[files[0]!],actionId:"premature"});assert.equal(premature.delivery,"pending");}
+    assert.equal(await f.svc.executorReady(t.id,c.relPath),false);assert.equal(f.sessions.size,2);
+    batchId="b1";await f.svc.registerArtifact(t.id,files[1]!,"b".repeat(64),b.relPath);await f.svc.onTurnEnd(t.id,b.relPath,"completed","b");
+    assert.equal(f.svc.getExecutorDependency(t.id,c.relPath).state,"ready");assert.equal(f.sessions.size,3);
+    assert.equal([...f.sessions.values()].find(s=>s.key.includes(c.relPath))!.deliveries.length,1,"显式交接与模块就绪不能重复自动唤醒");
+  }finally{await f.store.close();}
+});
+
+test("业务依赖：固定批次顺序造成的隐性循环在开工前拒绝",async()=>{
+  const f=await makeService();try{
+    const {input}=businessDependencyInput(f.directory);input.assignments![0]!.batches!.reverse();
+    const t=await f.svc.propose(input);
+    await assert.rejects(()=>f.svc.confirm(t.id),/调度循环/);
+    assert.equal(f.sessions.size,0);assert.equal(f.svc.getTask(t.id)!.status,"proposed");assert.equal(f.ledger.getBudget(t.id),undefined);
+  }finally{await f.store.close();}
+});
+
+test("业务依赖：完成批次后产物变化暂停，未启动下游",async()=>{
+  let valid=true;
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:"a1",activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{fileExists:()=>true,verifyArtifact:async()=>valid});
+  try{
+    const {a,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);await f.svc.confirm(t.id);
+    await f.svc.registerArtifact(t.id,files[0]!,"a".repeat(64),a.relPath);
+    (f.svc as any).o.onSubstantiveProgress=async(_id:string,note:string)=>{if(note.includes("批次"))valid=false;};
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","changed");
+    assert.equal(f.svc.getTask(t.id)!.pauseReason,"missing_input");assert.equal(f.sessions.size,1);
+  }finally{await f.store.close();}
+});
+
+test("业务依赖：唤醒投递未知时暂停且不盲目重发",async()=>{
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:"a1",activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);await f.svc.confirm(t.id);
+    await f.svc.registerArtifact(t.id,files[0]!,"a".repeat(64),a.relPath);f.unknownNextDeliveries(1);
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","unknown");assert.equal(f.svc.getTask(t.id)!.pauseReason,"missing_input");
+    const worker=[...f.sessions.values()].find(s=>s.key.includes(b.relPath))!,n=worker.deliveries.length;
+    await f.svc.resume(t.id);assert.equal(f.svc.getTask(t.id)!.status,"paused");assert.equal(worker.deliveries.length,n);
+  }finally{await f.store.close();}
+});
+
+test("业务依赖：已知唤醒失败有可恢复出口，恢复只交回一次",async()=>{
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:"a1",activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);await f.svc.confirm(t.id);
+    await f.svc.registerArtifact(t.id,files[0]!,"a".repeat(64),a.relPath);f.failNextDeliveries(1);
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","failed");assert.equal(f.svc.getTask(t.id)!.pauseReason,"missing_input");
+    const worker=[...f.sessions.values()].find(s=>s.key.includes(b.relPath))!;assert.equal(worker.deliveries.length,0);
+    await f.svc.resume(t.id);assert.equal(f.svc.getTask(t.id)!.status,"active");assert.equal(worker.deliveries.length,1);
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","failed");assert.equal(worker.deliveries.length,1);
+  }finally{await f.store.close();}
+});
+
+test("业务依赖：重建服务从落盘批次恢复，未满足前置的后批不误启",async()=>{
+  let batchId="a1";
+  const inspect=async():Promise<TurnContext>=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:batchId,activeCommand:false,pendingReply:false,unhandledEvent:false});
+  const extras:Extras={host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>true};
+  const f=await makeService(inspect,undefined,extras);let restored:Awaited<ReturnType<typeof makeService>>|undefined;
+  try{
+    const {a,b,files,input}=businessDependencyInput(f.directory),t=await f.svc.propose(input);await f.svc.confirm(t.id);
+    await f.svc.registerArtifact(t.id,files[0]!,"a".repeat(64),a.relPath);await f.svc.onTurnEnd(t.id,a.relPath,"completed","before-restart");
+    const store=await JsonStore.load(join(f.directory,"state.json"));restored=await makeService(inspect,undefined,extras,{store,ledger:new TokenLedger(store)});
+    await restored.svc.resumeAfterRestart(t.id);
+    assert.equal(restored.svc.getExecutorDependency(t.id,a.relPath).state,"waiting");
+    assert.equal(restored.sessions.size,1);assert.ok([...restored.sessions.values()][0]!.key.includes(b.relPath));
+    batchId="b1";await restored.svc.registerArtifact(t.id,files[1]!,"b".repeat(64),b.relPath);await restored.svc.onTurnEnd(t.id,b.relPath,"completed","after-restart");
+    assert.equal(restored.svc.getExecutorDependency(t.id,a.relPath).state,"ready");assert.equal(restored.sessions.size,2);
+    assert.match([...restored.sessions.values()].find(s=>s.key.includes(a.relPath))!.deliveries[0]!,/a2/);
+  }finally{await restored?.store.close();await f.store.close();}
+});
+
+test("模块批次：拒绝跳批与缺文件，持久推进、去重、交接后所有模块齐备才验收",async()=>{
+  let hashesValid=true;
+  let context:TurnContext={status:"active",reportedNextSteps:[],claimedDone:true,activeCommand:false,pendingReply:false,unhandledEvent:false,completedBatchId:"b1"};
+  const f=await makeService(async()=>context,async()=>"专家定义",{host:{dedupe:false},fileExists:()=>true,verifyArtifact:async()=>hashesValid});
+  try{
+    const a=expert("research/a.md"),b=expert("research/b.md"),one=join(tmpdir(),"module-server.ts"),two=join(tmpdir(),"module-api.ts"),three=join(tmpdir(),"module-server.test.ts");
+    const t=await f.svc.propose({...proposedInput({limitTokens:2_000_000,strict:true}),executionPlanVersion:1,goal:"开发后端系统",criteria:[{id:"backend",text:"BACKEND_ONLY"},{id:"tests",text:"TESTS_ONLY"}],deliverables:[one,two,three],executors:[a,b],assignments:[
+      {relPath:a.relPath,module:"后端模块",responsibilities:["architecture","backend"],coverageRationale:"同一负责人先确认边界再实现接口",criterionIds:["backend"],deliverables:[one,two],batches:[{id:"b1",title:"服务骨架",deliverables:[one]},{id:"b2",title:"业务接口",deliverables:[two]}]},
+      {relPath:b.relPath,module:"回归测试",responsibilities:["testing"],criterionIds:["tests"],deliverables:[three],waitFor:{fromRelPath:a.relPath,artifactRefs:[one,two]},batches:[{id:"tests",title:"运行回归并提供证据",deliverables:[three]}]},
+    ]});
+    await f.svc.confirm(t.id);assert.equal(f.sessions.size,1,"前置未交接不启动下游");
+    const worker=[...f.sessions.values()][0]!;assert.match(worker.deliveries[0]!,/BACKEND_ONLY/);assert.doesNotMatch(worker.deliveries[0]!,/TESTS_ONLY/);assert.match(worker.deliveries[0]!,/当前只执行批次 b1/);
+    await f.svc.onTurnEnd(t.id,a.relPath,"completed","missing");assert.deepEqual(f.svc.getBatchProgress(t.id)[0]!.completed,[]);
+    await f.svc.registerArtifact(t.id,one,"a".repeat(64),a.relPath);
+    hashesValid=false;await f.svc.onTurnEnd(t.id,a.relPath,"completed","stale-hash");assert.deepEqual(f.svc.getBatchProgress(t.id)[0]!.completed,[]);hashesValid=true;
+    context.pendingBackgroundResults=true;await f.svc.onTurnEnd(t.id,a.relPath,"completed","pending-results");assert.deepEqual(f.svc.getBatchProgress(t.id)[0]!.completed,[]);context.pendingBackgroundResults=false;
+    context.completedBatchId="b2";await f.svc.onTurnEnd(t.id,a.relPath,"completed","skip");assert.deepEqual(f.svc.getBatchProgress(t.id)[0]!.completed,[]);
+    context.completedBatchId="b1";await f.svc.onTurnEnd(t.id,a.relPath,"completed","one");assert.equal(f.svc.getBatchProgress(t.id)[0]!.currentBatch!.id,"b2");
+    const n=worker.deliveries.length;await f.svc.onTurnEnd(t.id,a.relPath,"completed","one");assert.equal(worker.deliveries.length,n);assert.equal(f.svc.getBatchProgress(t.id)[0]!.currentBatch!.id,"b2");
+    const disk=JSON.parse(await fs.readFile(join(f.directory,"state.json"),"utf8"));assert.ok(JSON.stringify(disk.collections.batchProgress).includes('b1'));
+    await f.svc.pause(t.id,"user","测试批次恢复");await f.svc.resume(t.id);
+    assert.match(worker.deliveries.at(-1)!,/只执行当前批次 b2/);assert.doesNotMatch(worker.deliveries.at(-1)!,/TESTS_ONLY/);
+    await f.svc.registerArtifact(t.id,two,"b".repeat(64),a.relPath);context.completedBatchId="b2";
+    const originalHandoff=(f.svc as any).sendExpertMessageLocked;(f.svc as any).sendExpertMessageLocked=async()=>{throw Error("模拟批次落盘后进程退出")};
+    await assert.rejects(()=>f.svc.onTurnEnd(t.id,a.relPath,"completed","two"),/进程退出/);(f.svc as any).sendExpertMessageLocked=originalHandoff;
+    assert.equal(f.svc.executorModuleComplete(t.id,a.relPath),true);hashesValid=false;await f.svc.resumeAfterRestart(t.id);
+    assert.equal(f.svc.getTask(t.id)!.pauseReason,"missing_input","交接文件已变化时暂停核对，不让上下游永久互等");hashesValid=true;await f.svc.resume(t.id);
+    assert.equal(f.svc.getTask(t.id)!.status,"active");assert.equal(await f.svc.executorReady(t.id,a.relPath),false);
+    assert.equal(f.svc.getExecutorDependency(t.id,b.relPath).state,"ready","前置模块完成后自动交接带哈希的产物");
+    assert.ok([...f.sessions.values()].some(s=>s.deliveries.some(m=>m.includes("TESTS_ONLY"))));assert.equal(f.svc.latestPendingRound(t.id),undefined);
+    await f.svc.registerArtifact(t.id,three,"c".repeat(64),b.relPath);context.completedBatchId="tests";
+    (f.svc as any).o.onSubstantiveProgress=async()=>{(f.svc as any).o.onSubstantiveProgress=undefined;await f.svc.pause(t.id,"user","最后一批落盘时用户暂停")};
+    await f.svc.onTurnEnd(t.id,b.relPath,"completed","three");assert.equal(f.svc.getTask(t.id)!.status,"paused");assert.equal(f.svc.latestPendingRound(t.id),undefined);
+    await f.svc.resume(t.id);assert.equal(f.svc.getTask(t.id)!.status,"awaiting_acceptance");assert.ok(f.svc.latestPendingRound(t.id));
+    const round=f.svc.latestPendingRound(t.id)!,reviewer=f.svc.currentVersion(f.svc.getTask(t.id)!).acceptor.relPath;
+    const verdicts:Verdict[]=[{criterionId:"backend",outcome:"gap",gap:"BACKEND_GAP",evidence:"接口证据",criteriaVersion:1,artifactHashes:round.artifactHashes,verdictBy:reviewer,createdAt:new Date().toISOString()},
+      {criterionId:"tests",outcome:"pass",gap:null,evidence:"测试证据",criteriaVersion:1,artifactHashes:round.artifactHashes,verdictBy:reviewer,createdAt:new Date().toISOString()}];
+    const testWorker=[...f.sessions.values()].find(s=>s.key.includes(b.relPath))!,testCount=testWorker.deliveries.length;
+    await f.svc.recordVerdicts(t.id,verdicts,round.artifactHashes,round.roundId);
+    assert.equal(f.svc.getTask(t.id)!.status,"rework");assert.equal(testWorker.deliveries.length,testCount,"后端返工不能误派给最后提交的测试专家");assert.match(worker.deliveries.at(-1)!,/BACKEND_GAP/);
+    assert.equal(f.svc.getBatchProgress(t.id)[0]!.currentBatch!.id,"b1");assert.equal(f.svc.executorModuleComplete(t.id,b.relPath),true);
+    context.completedBatchId="b1";await f.svc.onTurnEnd(t.id,a.relPath,"completed","repair-one");context.completedBatchId="b2";await f.svc.onTurnEnd(t.id,a.relPath,"completed","repair-two");
+    assert.equal(f.svc.getTask(t.id)!.status,"awaiting_acceptance");assert.notEqual(f.svc.latestPendingRound(t.id)!.roundId,round.roundId);
+  }finally{await f.store.close()}
+});
 
 test("审查34：并发答复原子占位，排队答案完整保存并在出队时优先送达", async () => {
   const {svc,store,sessions}=await makeService(undefined,undefined,{maxConcurrentTasks:1,host:{dedupe:false}});
@@ -484,7 +711,7 @@ test("交付物未落盘就声明完成：直接退回执行者，不建验收�
   assert.ok(last.includes("实际写入"), "退回消息要求落盘而非口头描述");
 });
 
-test("验收请求限定核对范围：只核对冻结产物、禁止写与检索、给出步数上限", async () => {
+test("验收请求限定核对范围：只核对冻结产物、禁止写与检索、按核对进展继续", async () => {
   const { svc, sessions } = await makeService(async () => ({
     status: "active", reportedNextSteps: [], claimedDone: true, activeCommand: false, pendingReply: false, unhandledEvent: false,
   }));
@@ -501,7 +728,7 @@ test("验收请求限定核对范围：只核对冻结产物、禁止写与检�
   assert.ok(req.includes("不做耗时命令"), "禁止耗时命令");
   assert.ok(req.includes("沙箱/权限报错"), "明确沙箱报错不是缺项证据");
   assert.ok(req.includes("一次性给出全部结论"), "要求一次收敛");
-  assert.ok(req.includes("最多 8 步（已用 0 步）"), "给出步数上限");
+  assert.ok(req.includes("每 8 步记录检查点"), "按核对进展而非固定8步硬停");
   // P2-9：没有声明只读能力集时，不得声称"已技术拦截"
   assert.ok(req.includes("没有工具级只读限制"), "如实降级表述");
   assert.ok(!req.includes("写入/删除/移动在工具层会被拒绝"), "不能空口承诺只读");
@@ -531,9 +758,7 @@ test("验收检查点：会话重建后接续已核对内容，不再从头核�
 
   const dead = [...sessions.values()].find((s) => s.key.startsWith("acceptor:"))!;
   dead.alive = false;
-  await svc.pause(task.id, "budget", "余额不足");
-  await svc.grantBudget(task.id, 100_000, "用户批准追加", "approval-1");
-  await svc.resume(task.id);
+  await svc.resumeAfterRestart(task.id);
 
   const resumed = [...sessions.values()].filter((s) => s.key.startsWith("acceptor:")).at(-1)!;
   assert.notEqual(resumed.key, dead.key, "失效会话被替换");
@@ -736,7 +961,7 @@ test("重开任务确认时继承原任务用量（设计文档 §2-5）", async
 test("派工闸门与请求前准入同口径：额度够不了一步就当场暂停，不建空会话", async () => {
   const { svc, ledger, sessions } = await makeService();
   // 默认准入策略：基线输入 12,000 × 1.25 + 输出上限 8,000 = 23,000
-  const need = requestAdmissionCost(DEFAULT_ADMISSION);
+  const need = requestAdmissionCost({...DEFAULT_ADMISSION,maxOutputTokens:8000});
   assert.equal(need, 23_000);
 
   const task = await svc.propose(proposedInput({ limitTokens: need - 1, strict: true }));
@@ -817,7 +1042,7 @@ test("恢复时不做无谓扣费：额度不足一步时 resume 被拒且不投
   assert.deepEqual([...sessions.values()].map((s) => s.deliveries.length), before, "被拒的恢复不投递");
 });
 
-test("执行者简报带收敛纪律：先写后改、限制读文件次数、给出步数上限", async () => {
+test("执行者简报带收敛纪律：先写后改、定向阅读、默认按预算及进展继续", async () => {
   const { svc, sessions } = await makeService(async () => ({
     status: "active", reportedNextSteps: [], claimedDone: false, activeCommand: false, pendingReply: false, unhandledEvent: false,
   }));
@@ -826,10 +1051,10 @@ test("执行者简报带收敛纪律：先写后改、限制读文件次数、�
   const brief = [...sessions.values()].find((s) => s.key.startsWith("executor:"))!.deliveries[0]!;
   assert.ok(brief.includes("收敛纪律"), "有收敛纪律章节");
   assert.ok(brief.includes("先落盘第一版交付物"), "先写后改，避免通读资料");
-  assert.ok(brief.includes("不超过 6 次"), "读预算量化到次数，而不是泛泛的'少读'");
-  assert.ok(brief.includes("永久留在上下文里"), "说明读取的持续成本");
-  assert.ok(brief.includes("不需要为核对内部实现去读源码"), "把'核对源码'这条歧义路径关掉");
-  assert.ok(brief.includes("最多执行 24 步"), "给出执行步数上限");
+  assert.ok(brief.includes("不设固定读取次数硬上限"), "读取不按固定次数打断");
+  assert.ok(brief.includes("避免重复读取"), "提示减少无效上下文");
+  assert.ok(brief.includes("核对相关源码和接口"), "实现前必须核对代码");
+  assert.ok(brief.includes("不设固定累计执行步数上限"), "默认按预算与进展控制");
   assert.ok(brief.includes("不要整篇重写"), "恢复时不重写已有产物");
 });
 
@@ -1078,7 +1303,7 @@ test('验收成本预览复用真实请求正文，未知产物和文件增长�
   }finally{await store.close();}
 });
 
-test("读预算指令：超过读上限后打断一次，转入只写；每任务版本只发一次", async () => {
+test("读预算指令：超过配置阈值只提醒当前Worker，仍可阅读验证", async () => {
   const { svc, sessions } = await makeService(async () => ({
     status: "active", reportedNextSteps: ["x"], claimedDone: false, activeCommand: false, pendingReply: false, unhandledEvent: false,
   }));
@@ -1090,11 +1315,14 @@ test("读预算指令：超过读上限后打断一次，转入只写；每任�
   assert.equal(await svc.requestReadStop(task.id, 7), true);
   assert.equal(executor.deliveries.length, before + 1);
   const stop = executor.deliveries.at(-1)!;
-  assert.ok(stop.includes("读预算用尽"), "点明读预算");
-  assert.ok(stop.includes("不要再 read/grep/glob"), "给出禁止清单");
-  assert.ok(stop.includes("永久留在上下文里"), "说明为什么会变贵");
+  assert.ok(stop.includes("读取提醒"), "提示当前读取次数");
+  assert.ok(stop.includes("仍可继续"), "保留必要阅读");
+  assert.ok(stop.includes("只发给当前执行者"), "限定提醒范围");
   assert.ok(stop.includes("<longtask_report>"), "要求给出报告块");
   assert.equal(executor.targets.at(-1), "next-step", "读预算提醒进入当前轮下一步");
+  const peer=[...sessions.values()].find(s=>s.key.startsWith("executor:")&&s.key!==executor.key)!;
+  assert.equal(peer.deliveries.length,1,"A的提醒不能广播给B");
+  assert.equal(await svc.requestReadStop(task.id,7,"research/b.md"),true,"B有自己的提醒周期");
 
   assert.equal(await svc.requestReadStop(task.id, 12), false);
   assert.equal(executor.deliveries.length, before + 1, "同一版本只打断一次");
@@ -1115,7 +1343,7 @@ test("读预算并发去重：同一批 tool/call 同时触发时只投递一条
   ]);
   assert.equal(results.filter(Boolean).length, 1, "并发触发只允许一条生效");
   assert.equal(executor.deliveries.length, before + 1, "不得重复投递同一条收敛指令");
-  assert.equal(executor.deliveries.filter((d) => d.includes("读预算用尽")).length, 1);
+  assert.equal(executor.deliveries.filter((d) => d.includes("读取提醒")).length, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -1775,4 +2003,71 @@ test("审查33 C10/C11：澄清答复能接回；重开消息带完整新标准"
   assert.ok(reopenMsg, "已有会话必须收到版本变更通知");
   assert.ok(reopenMsg!.includes("UNIQUE_CRITERION_34C7"), "通知里必须带完整新标准，而不是泛化一句");
   assert.ok(reopenMsg!.includes("v2"), "必须说明版本号");
+});
+
+test("验收能力缺失保留当前轮次等待补齐，不把正确产物交回返工",async()=>{
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,activeCommand:false,pendingReply:false,unhandledEvent:false}));
+  try {
+    const t=await f.svc.propose(proposedInput());await f.svc.confirm(t.id);await registerDeliverables(f.svc,t.id);
+    await f.svc.onTurnEnd(t.id,"research/a.md","completed","submit");
+    const round=f.svc.latestPendingRound(t.id)!;
+    const verdicts=validVerdicts("research/reviewer.md",CRITERIA,1,{c2:{outcome:"gap",gapKind:"capability",gap:"需要只读官网核对工具",evidence:"当前验收工具未提供外部资料读取能力"}});
+    assert.equal(await f.svc.recordVerdicts(t.id,verdicts,round.artifactHashes,round.roundId),"paused");
+    assert.equal(f.svc.getTask(t.id)!.status,"paused");
+    assert.equal(f.svc.latestPendingRound(t.id)!.roundId,round.roundId);
+    assert.equal([...f.sessions.values()].filter(s=>s.key.startsWith("executor:")).every(s=>s.deliveries.length===1),true);
+    await f.svc.resume(t.id);assert.equal(f.svc.getTask(t.id)!.status,"awaiting_acceptance");
+  }finally{await f.store.close();}
+});
+
+test("共享完成标准返工会通知所有参与模块，各自仍只执行自己的文件批次",async()=>{
+  const f=await makeService(async key=>({status:"active",reportedNextSteps:[],claimedDone:true,activeCommand:false,pendingReply:false,unhandledEvent:false,completedBatchId:key.includes("/a.md")?"b0":"b1"}),undefined,{fileExists:()=>true,verifyArtifact:async()=>true});
+  try {
+    const files=[join(f.directory,"customers.ts"),join(f.directory,"payment.php")];
+    const assignments=files.map((file,i)=>({relPath:`research/${i?"b":"a"}.md`,module:i?"支付模块":"客户模块",responsibilities:i?["backend"]:["architecture","backend","testing"],coverageRationale:"模块独立实现并覆盖测试",criterionIds:["flow"],deliverables:[file],batches:[{id:`b${i}`,title:"实现业务流程",deliverables:[file]}]}));
+    const t=await f.svc.propose({...proposedInput({limitTokens:2000000,strict:true}),executionPlanVersion:1,goal:"开发后端系统",criteria:[{id:"flow",text:"业务流程正确"}],deliverables:files,assignments});
+    await f.svc.confirm(t.id);
+    for(let i=0;i<2;i++)await f.svc.registerArtifact(t.id,files[i]!,"a".repeat(64),assignments[i]!.relPath);
+    await f.svc.onTurnEnd(t.id,"research/a.md","completed","a-done");
+    await f.svc.onTurnEnd(t.id,"research/b.md","completed","b-done");
+    const round=f.svc.latestPendingRound(t.id)!;
+    await f.svc.recordVerdicts(t.id,validVerdicts("research/reviewer.md",[{id:"flow",text:"业务流程正确"}],1,{flow:{outcome:"gap",gap:"共同核对流程边界"}}),round.artifactHashes,round.roundId);
+    for(const a of assignments){
+      const worker=[...f.sessions.values()].find(s=>s.key.startsWith("executor:")&&s.key.includes(a.relPath))!;
+      assert.match(worker.deliveries.at(-1)!,/验收退回/);assert.match(worker.deliveries.at(-1)!,new RegExp(a.module));
+    }
+  }finally{await f.store.close();}
+});
+
+test("旧验收窗口检查点不能覆盖用户恢复后的步数与核对进度",async()=>{
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,activeCommand:false,pendingReply:false,unhandledEvent:false}));
+  try{
+    const t=await f.svc.propose(proposedInput());await f.svc.confirm(t.id);await registerDeliverables(f.svc,t.id);
+    await f.svc.onTurnEnd(t.id,"research/a.md","completed","submit");
+    const round=f.svc.latestPendingRound(t.id)!;
+    await Promise.all([f.svc.recordAcceptorProgress(t.id,round.roundId,{steps:2,checkedCriteria:["c1"]}),f.svc.recordAcceptorProgress(t.id,round.roundId,{steps:3,checkedCriteria:["c2"]})]);
+    assert.deepEqual(f.svc.latestPendingRound(t.id)!.checkpoint!.checkedCriteria,["c1","c2"]);
+    await f.svc.pause(t.id,"missing_input","人工恢复测试");await f.svc.resume(t.id);
+    await f.svc.recordAcceptorProgress(t.id,round.roundId,{steps:8,stepEpoch:0,lastSummary:"旧窗口迟到内容"});
+    const cp=f.svc.latestPendingRound(t.id)!.checkpoint!;assert.equal(cp.stepEpoch,1);assert.equal(cp.steps,0);assert.notEqual(cp.lastSummary,"旧窗口迟到内容");
+  }finally{await f.store.close();}
+});
+
+test("重开更新业务边界时复用Worker也刷新模块上下文，不重复注入未变矩阵",async()=>{
+  const f=await makeService(async()=>({status:"active",reportedNextSteps:[],claimedDone:true,completedBatchId:"all",activeCommand:false,pendingReply:false,unhandledEvent:false}),undefined,{fileExists:()=>true,verifyArtifact:async()=>true});
+  try{
+    const files=[join(f.directory,"customer.ts"),join(f.directory,"customer.test.ts")];
+    const workModules=[{id:"customer",title:"客户业务",scope:"OLD_SCOPE",leadRelPath:"research/a.md",criterionIds:["c1","c2"],deliverables:files}];
+    const t=await f.svc.propose({...proposedInput({limitTokens:2000000,strict:true}),goal:"开发后端系统",executionPlanVersion:2,executors:[expert("research/a.md")],deliverables:files,workModules,assignments:[{relPath:"research/a.md",module:"客户服务",responsibilities:["architecture","backend","testing"],coverageRationale:"小范围服务实现与测试",criterionIds:["c1","c2"],deliverables:files,batches:[{id:"all",title:"实现并测试",deliverables:files}]}]});
+    await f.svc.confirm(t.id);const worker=[...f.sessions.values()][0]!;assert.match(worker.deliveries[0]!,/OLD_SCOPE/);
+    for(const file of files)await f.svc.registerArtifact(t.id,file,"a".repeat(64),"research/a.md");
+    await f.svc.onTurnEnd(t.id,"research/a.md","completed","submit");
+    const round=f.svc.latestPendingRound(t.id)!;
+    await f.svc.recordVerdicts(t.id,validVerdicts("research/reviewer.md",CRITERIA,1),round.artifactHashes,round.roundId);
+    await f.svc.reopenWithCriteria(t.id,{criteria:[{id:"c1",text:"修订后的客户业务标准"}],reason:"纠错重开",expectedVersion:1,workModules:workModules.map(m=>({...m,scope:"NEW_SCOPE"}))});
+    assert.equal([...f.sessions.values()].filter(s=>s.key.startsWith("executor:")).length,1);
+    assert.match(worker.deliveries.at(-1)!,/NEW_SCOPE/);assert.doesNotMatch(worker.deliveries.at(-1)!,/OLD_SCOPE/);
+    await f.svc.requestReadStop(t.id,7,"research/a.md");
+    assert.doesNotMatch(worker.deliveries.at(-1)!,/NEW_SCOPE/,"相同矩阵不随每条提醒重复注入");
+  }finally{await f.store.close();}
 });

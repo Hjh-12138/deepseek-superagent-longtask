@@ -86,3 +86,15 @@ test("恢复可证明未发出的占位不收费；核对到真实用量按原�
     await f.ledger.reconcile(sent, usage, true); assert.equal(f.ledger.moneyView("t")?.calculatedAmount, "0.00668"); assert.equal(f.ledger.moneyView("t")?.reservedAmount, "0");
   } finally {await f.store.close();}
 });
+
+test("未来验收输入按输入价保留，实际请求上限与原金额保护不变",async()=>{
+  const f=await fixture("8");try{
+    const plan={inputTokens:555024,outputTokens:512000};
+    const forecast=f.ledger.moneyForecast("t",21000,256000,plan)!;
+    assert.equal(formatCny(forecast.protected),"5.206048");
+    const id=await f.reserve(21000,256000);
+    await f.ledger.reserveMoney(id,route,21000,256000,plan,identity);
+    assert.equal(f.ledger.moneyView("t")!.reservedAmount,"2.09");
+    assert.equal(f.ledger.moneyView("t")!.limitAmount,"8");
+  }finally{await f.store.close();}
+});

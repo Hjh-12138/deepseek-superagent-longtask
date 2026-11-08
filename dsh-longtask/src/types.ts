@@ -44,7 +44,19 @@ export type PauseReason = "user" | "budget" | "missing_input" | "watchdog" | "ho
 export interface Criterion {
   id: string;
   text: string;
+  /** 与条文中的实测要求合并；不能用review覆盖明确的运行/浏览器要求。 */
+  verification?: Array<"review" | "command" | "browser">;
 }
+
+export interface VerificationPlan {
+  /** 已确认的项目目录；实测只在其临时副本内运行。 */
+  workspace: string;
+  checks: Array<{id: string; kind: "command" | "browser"; criterionIds: string[]; purpose: string;
+    program: string; args: string[]; timeoutMs: number}>;
+}
+
+export type TaskWorkKind = "development" | "verification" | "document";
+export interface VerificationScope { included: string[]; excluded: string[] }
 
 export interface BudgetSpec {
   /** New formal tasks use CNY; old token tasks are kept without conversion. */
@@ -59,11 +71,35 @@ export interface BudgetSpec {
 export interface ExecutorAssignment {
   relPath: string;
   deliverables: string[];
+  module?: string;
+  responsibilities?: string[];
+  criterionIds?: string[];
+  coverageRationale?: string;
+  /** 顺序执行；每批最多四个确切文件，不把整个系统塞进一次输出。 */
+  batches?: Array<{id: string; title: string; deliverables: string[]}>;
   waitFor?: { fromRelPath: string; artifactRefs: string[] };
 }
 
 /** 任务的某一版目标/标准/预算。用户确认后生效；变更需确认新版本。 */
+export interface WorkModule {
+  id: string;
+  title: string;
+  scope: string;
+  leadRelPath: string;
+  contributors?: string[];
+  criterionIds: string[];
+  deliverables: string[];
+  dependsOn?: string[];
+}
+
 export interface TaskVersion {
+  workKind?: TaskWorkKind;
+  verificationScope?: VerificationScope;
+  verificationPolicyVersion?: 1;
+  verificationPlan?: VerificationPlan;
+  executionPlanVersion?: 1 | 2;
+  workModules?: WorkModule[];
+  staffingRationale?: string;
   version: number;
   goal: string;
   criteria: Criterion[];
@@ -74,6 +110,7 @@ export interface TaskVersion {
   assignments?: ExecutorAssignment[];
   /** 执行者开步前必须已经装载的工具；不改变验收者能力集。 */
   requiredTools?: string[];
+  acceptorRequiredTools?: string[];
   /** 独立验收专家，变更需用户单独确认 */
   acceptor: ExpertRef;
   budget: BudgetSpec;
@@ -106,7 +143,7 @@ export interface Task {
 
 export interface WaitingState {
   /** 在等什么：后台命令 / 某位专家 / 用户答复 / 验收结果 */
-  kind: "background_command" | "expert_message" | "user_reply" | "acceptance" | "external";
+  kind: "background_command" | "expert_message" | "user_reply" | "user_approval" | "acceptance" | "external";
   description: string;
   /** 唤醒条件的事件类型或去重键 */
   wakeCondition: string | null;
@@ -120,7 +157,7 @@ export interface WaitingState {
 export interface TaskWait {
   id: string;
   taskId: string;
-  kind: "background_command" | "expert_message" | "user_reply" | "acceptance" | "external";
+  kind: WaitingState["kind"];
   description: string;
   /** 唤醒条件：dependency:<relPath> / acceptance / user_reply / turn:<turnId>；null 表示只能人工解除 */
   wakeCondition: string | null;
@@ -200,12 +237,16 @@ export interface MessageRecord {
 export type VerdictOutcome = "pass" | "gap";
 
 export interface Verdict {
+  /** 只认可宿主专用验证工具实际生成的运行记录，不接受文字自报。 */
+  verificationRunIds?: string[];
   criterionId: string;
   outcome: VerdictOutcome;
   /** 证据引用（产物版本哈希、文件位置、会话消息） */
   evidence: string;
   /** 缺项说明（outcome=gap 时必填） */
   gap: string | null;
+  /** 核对能力不足应暂停补齐能力，不能让执行者反复修改正确产物。 */
+  gapKind?: "deliverable" | "capability";
   /** 验收时核对的标准版本与产物哈希；变化则旧结论失效 */
   criteriaVersion: number;
   artifactHashes: Record<string, string>;
@@ -266,8 +307,10 @@ export interface TaskBudgetState {
 // ---------------------------------------------------------------------------
 
 export type EventType =
+  | "task.batch_completed"
   | "task.proposed"
   | "task.router_bound"
+  | "task.approval_changed"
   | "task.confirmed"
   | "task.dispatch"
   | "task.continue"
@@ -331,6 +374,8 @@ export interface TaskProgressState {
   taskId: string;
   /** 最近实质进展时间；重复发消息本身不算进展（实施文档 §3-5） */
   lastSubstantiveAt: string;
+  /** 当前执行阶段的观察起点；恢复/重启不把暂停时间算成停滞，也不伪造产出。 */
+  observationStartedAt?: string;
   /** 最近 N 次投递指令的内容哈希，用于识别无效重复 */
   recentInstructionHashes: string[];
   /** 纠偏次数 */
