@@ -10,6 +10,15 @@ const front=e("engineering/frontend.md","Frontend Developer"),back=e("engineerin
   unity=e("game-development/unity/developer.md","Unity Developer"),shader=e("game-development/unity/shader.md","Unity Shader Engineer");
 const catalog=[front,back,db,dbre,api,qa,apiTester,reviewer,market,godot,multi,unity,shader];
 
+test("写作目标中的技术主题不触发开发职责，独立开发要求仍保留",()=>{
+  for(const goal of ['编写API接口使用文档','撰写数据库测试指南','整理前端浏览器兼容性报告','帮我写一份API文档','请帮我只需要编写数据库测试指南']){
+    assert.equal(recommendExperts(catalog,goal+'\n文档包含接口测试、npm test与部署说明').domain,'general');
+  }
+  for(const goal of ['开发API系统并编写使用文档','编写API文档并实现演示代码','编写前端代码和文档','编写API文档，并实际开发后端']){
+    assert.equal(recommendExperts(catalog,goal).domain,'software',goal);
+  }
+});
+
 test("中文多关键词按专长组合排序，数据库性能与API测试不退化成泛后端",()=>{
   assert.equal(searchExperts(catalog,"数据库性能优化")[0]!.expert.relPath,db.relPath);
   assert.equal(searchExperts(catalog,"API测试")[0]!.expert.relPath,apiTester.relPath);

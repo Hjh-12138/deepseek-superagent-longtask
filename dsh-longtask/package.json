@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-longtask",
   "description": "DSH 通用长任务插件：任务生命周期、专家目录、金额预算与请求账本、Watchdog 与恢复",
-  "version": "0.1.2-rc.6",
+  "version": "0.1.2-rc.19",
   "private": true,
   "type": "module",
   "main": "dist/src/index.js",
@@ -10,19 +10,29 @@
       "types": "./dist/src/index.d.ts",
       "default": "./dist/src/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client/client.js"
   },
   "types": "dist/src/index.d.ts",
   "files": [
+    "client",
     "dist/src",
     "cordis.patch.yml",
     "README.md",
     "RELEASE.md",
     "CHANGELOG.md",
     "release/config.example.yml",
-    "scripts/diagnose.mjs"
+    "scripts/diagnose.mjs",
+    "scripts/crm-verification.mjs",
+    "scripts/export-acceptance.mjs"
   ],
   "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     }

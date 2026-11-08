@@ -18,6 +18,11 @@ import type { Store, Tx } from "../store/store.js";
 import { newId } from "../store/store.js";
 import type { TokenLedger } from "../ledger/token-ledger.js";
 import {parseCny, formatCny} from "../ledger/money.js";
+import {validateExecutionPlan,moduleBatchPrerequisites} from "../execution-plan.js";
+import {validateVerificationPlan,verificationReview,missingVerification,verifyRunInputs,VERIFICATION_RUNS,VERIFICATION_TOOL,type VerificationRun} from "../verification.js";
+import {queueDeliveryEvidence} from "../delivery-evidence.js";
+import {taskWorkKind} from "../work-kind.js";
+import {DEFAULT_JOB_TIMEOUT_MS,jobWithinGrace,type ObservedJob} from "./job-state.js";
 import {
   normalizeAdmission,
   estimateRequestInput,
@@ -27,6 +32,10 @@ import {
 } from "../budget/admission.js";
 import type {
   Criterion,
+  VerificationPlan,
+  VerificationScope,
+  TaskWorkKind,
+  WorkModule,
   EventType,
   ExpertRef,
   MessageRecord,
@@ -75,6 +84,7 @@ export interface HostBridge {
 export type TurnEndKind = "completed" | "aborted" | "max-tokens" | "cancelled" | "error";
 
 export interface TurnContext {
+  completedBatchId?: string;
   canContinueTruncated?: boolean;
   status: Task["status"];
   /** Worker 本轮报告的可执行缺项（由监听器从结构化报告提取） */
@@ -149,12 +159,20 @@ interface ClarificationAnswer {
 }
 
 export interface ProposeInput {
+  workKind?: TaskWorkKind;
+  verificationScope?: VerificationScope;
+  verificationPolicyVersion?: 1;
+  verificationPlan?: VerificationPlan;
+  executionPlanVersion?: 1 | 2;
+  workModules?: WorkModule[];
+  staffingRationale?: string;
   goal: string;
   criteria: Criterion[];
   deliverables: string[];
   executors: ExpertRef[];
   assignments?: ExecutorAssignment[];
   requiredTools?: string[];
+  acceptorRequiredTools?: string[];
   acceptor: ExpertRef;
   budget: import("../types.js").BudgetSpec;
 }
@@ -165,6 +183,7 @@ export type ExpertLoader = (ref: ExpertRef) => Promise<string>;
 export type DispatchGateResult = { ok: true; reservationId: string } | { ok: false; reason: string };
 
 export interface TaskServiceOptions {
+  verificationIssue?(version:TaskVersion):string|undefined;
   store: Store;
   ledger: TokenLedger;
   host: HostBridge;
@@ -183,10 +202,15 @@ export interface TaskServiceOptions {
   onSubstantiveProgress?: (taskId: string, note: string) => void | Promise<void>;
   /** Watchdog 钩子：登记派工指令（用于识别"重复发同一消息"） */
   onInstruction?: (taskId: string, content: string) => void | Promise<void>;
-  /** 验收会话的最大准入步数：超出即暂停交人工，不无限探查（默认 8） */
+  /** 可选验收累计步数硬上限；0/缺省按进展和原预算继续。 */
   acceptorMaxSteps?: number;
-  /** 执行会话的最大准入步数：超出即暂停交人工，避免"读到没预算"（默认 24） */
+  acceptorProgressWindowSteps?: number;
+  acceptorMaxIdleSteps?: number;
+  /** 执行会话可选累计步数上限；0/缺省不设硬上限，预算及进展约束保持。 */
   executorMaxSteps?: number;
+  backgroundJobTimeoutMs?: number;
+  acceptanceReadBudgetBytes?: number;
+  acceptorToolIssue?: (names: string[]) => string | undefined;
   /**
    * 产物磁盘核验（P1-5）：验收结算前回算文件哈希，确认产物仍等于冻结版本。
    * 不传则不核验磁盘（仅比对模型回传的哈希）——生产入口必须传。
@@ -241,6 +265,8 @@ export interface AcceptanceRound {
 }
 
 export interface AcceptanceCheckpoint {
+  /** 用户显式恢复时更新；普通重启沿用本窗口，不能绕过同轮上限。 */
+  stepEpoch?: number;
   /** 已准入的验收步数 */
   steps: number;
   /** 上一轮验收输出的摘要（截断保存，仅用于提示"已核过什么"） */
@@ -251,6 +277,9 @@ export interface AcceptanceCheckpoint {
 }
 
 export class TaskService {
+  readonly limitPolicyProtocol = 1;
+  readonly acceptanceRuntimeProtocol = 1;
+  readonly verificationEvidenceProtocol = 1;
   readonly moneyConfirmationProtocol = 1;
   /** 用户审批的版本约束必须在确认事务中检查；用于检测宿主热重载的旧模块缓存。 */
   readonly userConfirmationProtocol = 1;
@@ -369,23 +398,48 @@ export class TaskService {
     if (!version.assignments) return;
     const path = (raw: string) => this.o.resolveDeliverable ? this.o.resolveDeliverable(raw) : resolve(raw);
     version.deliverables = version.deliverables.map(path);
+    if (version.workModules) version.workModules=version.workModules.map(m=>({...m,deliverables:m.deliverables.map(path)}));
     version.assignments = version.assignments.map((a) => ({ ...a, deliverables: a.deliverables.map(path),
+      ...(a.batches ? {batches:a.batches.map(b=>({...b,deliverables:b.deliverables.map(path)}))}:{}),
       ...(a.waitFor ? { waitFor: { ...a.waitFor, artifactRefs: a.waitFor.artifactRefs.map(path) } } : {}) }));
+  }
+
+  private modulePrerequisites(taskId:string,relPath:string) {
+    const task=this.getTask(taskId),batch=this.getBatchProgress(taskId).find(p=>p.relPath===relPath)?.currentBatch;
+    return task&&batch&&this.currentVersion(task).executionPlanVersion===2
+      ? moduleBatchPrerequisites(this.currentVersion(task),relPath,batch.id) : [];
+  }
+
+  private pendingModulePrerequisites(taskId:string,relPath:string) {
+    const progress=this.getBatchProgress(taskId);
+    return this.modulePrerequisites(taskId,relPath).filter(d=>!progress.find(p=>p.relPath===d.relPath)?.completed.includes(d.batchId));
+  }
+
+  private async verifyModuleInputs(taskId:string,relPath:string):Promise<boolean> {
+    for(const file of new Set(this.modulePrerequisites(taskId,relPath).flatMap(d=>d.deliverables))){
+      const artifact=this.currentArtifacts(taskId).find(x=>this.artifactLocationKey(x.location)===this.artifactLocationKey(file));
+      if(!artifact?.contentHash||(this.o.verifyArtifact&&!await this.o.verifyArtifact(file,artifact.contentHash))){
+        await this.pause(taskId,"missing_input","业务模块依赖产物缺失或版本已变，请核对后恢复；未派工下游。");return false;
+      }
+    }
+    return true;
   }
 
   private matchesDependency(task: Task, relPath: string, message: MessageRecord): boolean {
     const version = this.currentVersion(task);
     const dep = version.assignments?.find((a) => a.relPath === relPath)?.waitFor;
-    return Boolean(dep && message.taskVersion === version.version && message.fromRelPath === dep.fromRelPath && message.toRelPath === relPath
+    return Boolean(dep && !this.pendingModulePrerequisites(task.id,relPath).length && message.taskVersion === version.version && message.fromRelPath === dep.fromRelPath && message.toRelPath === relPath
       && dep.artifactRefs.every((path) => message.artifactRefs?.some((ref) => this.artifactLocationKey(ref) === this.artifactLocationKey(path)
         && /^[a-f0-9]{64}$/.test(message.artifactVersions?.[ref] ?? ""))));
   }
 
   getExecutorDependency(taskId: string, relPath: string): {
-    state: "waiting" | "ready"; fromRelPath?: string; artifactRefs?: string[]; messageId?: string;
+    state: "waiting" | "ready"; fromRelPath?: string; artifactRefs?: string[]; messageId?: string; moduleIds?:string[];
   } {
     const task = this.getTask(taskId);
     const dep = task && this.currentVersion(task).assignments?.find((a) => a.relPath === relPath)?.waitFor;
+    const pending=this.pendingModulePrerequisites(taskId,relPath);
+    if(pending.length)return {state:"waiting",...(dep?structuredClone(dep):{}),moduleIds:[...new Set(pending.flatMap(d=>d.moduleIds))]};
     if (!task || !dep) return { state: "ready" };
     const message = this.o.store.list<MessageRecord>(COLLECTION_MESSAGES).find((m) => m.taskId === taskId && m.kind === "expert_direct"
       && m.delivery === "delivered" && this.matchesDependency(task, relPath, m));
@@ -394,45 +448,76 @@ export class TaskService {
 
   /** 等到投递临界区结束再判准入，避免 followup 已启动而送达事务尚未提交的竞态。 */
   async executorReady(taskId: string, relPath: string): Promise<boolean> {
-    return this.withTaskLock(taskId, async () => this.getExecutorDependency(taskId, relPath).state === "ready");
+    return this.withTaskLock(taskId, async () => {
+      if(this.executorModuleComplete(taskId,relPath))return false;
+      if(this.getExecutorDependency(taskId,relPath).state==="waiting"){await this.recordDependencyWaits(taskId);return false;}
+      return this.verifyModuleInputs(taskId,relPath);
+    });
   }
 
   private async recordDependencyWaits(taskId: string): Promise<void> {
     const task = this.getTask(taskId)!; const version = this.currentVersion(task);
     await this.o.store.transact((data) => {
       for (const a of version.assignments ?? []) {
-        if (!a.waitFor || this.getExecutorDependency(taskId, a.relPath).state === "ready") continue;
+        const dependency=this.getExecutorDependency(taskId,a.relPath);
+        if (dependency.state === "ready") continue;
+        const batch=this.getBatchProgress(taskId).find(p=>p.relPath===a.relPath)?.currentBatch;
+        if(batch&&this.modulePrerequisites(taskId,a.relPath).length){
+          const key=JSON.stringify([taskId,version.version,a.relPath,batch.id]),table=(data.collections.moduleDependencyDispatches??={});
+          const previous=table[key] as {generation:number;status:string}|undefined;
+          table[key]={generation:previous?previous.generation+(previous.status==="delivered"?1:0):0,status:"waiting"};
+        }
         this.registerWaitInTx(data, taskId, {
           kind: "expert_message",
-          description: `${a.relPath} 等待 ${a.waitFor.fromRelPath} 交接 ${a.waitFor.artifactRefs.join("、")}`,
+          description: dependency.moduleIds?.length ? `${a.relPath} 当前批次等待业务模块 ${dependency.moduleIds.join("、")}` : `${a.relPath} 等待 ${a.waitFor!.fromRelPath} 交接 ${a.waitFor!.artifactRefs.join("、")}`,
           wakeCondition: `dependency:${a.relPath}`,
         });
         data.appendEvent({ eventId: newId("evt"), taskId, taskVersion: version.version, source: "router", type: "expert.waiting",
-          payloadRef: null, payload: { relPath: a.relPath, waitFor: a.waitFor, scheduled: true }, causedBy: null,
-          dedupeKey: `executor-wait:${taskId}:v${version.version}:${a.relPath}:${createHash("sha256").update(JSON.stringify(a.waitFor)).digest("hex")}`,
+          payloadRef: null, payload: { relPath: a.relPath, waitFor: a.waitFor??null, moduleIds:dependency.moduleIds??[], scheduled: true }, causedBy: null,
+          dedupeKey: `executor-wait:${taskId}:v${version.version}:${a.relPath}:${createHash("sha256").update(JSON.stringify({waitFor:a.waitFor,batch:this.getBatchProgress(taskId).find(p=>p.relPath===a.relPath)?.currentBatch?.id,moduleIds:dependency.moduleIds})).digest("hex")}`,
           createdAt: this.now().toISOString() });
       }
     });
   }
 
   private readonly observedWriters = new Map<string, string>();
+  private readonly deliveredPlanContexts = new Map<string, string>();
 
   /** 成功工具结果提供作者证据；先同步记住，后续扫描不能抢认尚未结束轮次的文件。 */
-  noteArtifactWrite(taskId: string, relPath: string, location: string, callId: string): Promise<void> {
+  async noteArtifactWrite(taskId: string, relPath: string, location: string, callId: string): Promise<void> {
     const task = this.getTask(taskId);
     if (!task || !["active", "rework"].includes(task.status)) return Promise.resolve();
     const version = this.currentVersion(task);
     if (!version.executors.some((e) => e.relPath === relPath) || !version.deliverables.some((p) => this.artifactLocationKey(p) === this.artifactLocationKey(location))) return Promise.resolve();
     const key = `${taskId}:v${version.version}:${this.artifactLocationKey(location)}`;
     if (!this.observedWriters.has(key)) this.observedWriters.set(key, relPath);
-    return this.o.store.transact((data) => {
+    // 成功写入即可证明批次正在推进，不必等整轮结束/批次报告。
+    // 比较实际内容，重复工具结果或反复写同一内容不能刷新停滞计时。
+    const { readFile } = await import("node:fs/promises");
+    const contentHash = await readFile(this.resolveDeliverable(location)).then(bytes => createHash("sha256").update(bytes).digest("hex"), () => null);
+    let changed = false;
+    await this.o.store.transact((data) => {
+      const live = data.collections[COLLECTION_TASKS]?.[taskId] as Task | undefined;
+      if (!live || !["active", "rework"].includes(live.status) || this.currentVersion(live).version !== version.version) return;
       const dedupeKey = `artifact-write:${taskId}:${callId}`;
       if (data.findByDedupe(dedupeKey)) return;
       const table = (data.collections.artifactWriters ??= {});
-      table[key] = { taskId, taskVersion: version.version, location, firstWriter: this.observedWriters.get(key), writer: relPath };
+      const previousHash = (table[key] as { contentHash?: string } | undefined)?.contentHash
+        ?? this.currentArtifacts(taskId).find(a => this.artifactLocationKey(a.location) === this.artifactLocationKey(location))?.contentHash;
+      changed = contentHash !== null && contentHash !== previousHash;
+      if (changed) (data.collections.truncationCounts ??= {})[`${taskId}:v${version.version}:${relPath}`] = 0;
+      table[key] = { taskId, taskVersion: version.version, location, firstWriter: this.observedWriters.get(key), writer: relPath, contentHash };
       data.appendEvent({ eventId: newId("evt"), taskId, taskVersion: version.version, source: "worker", type: "artifact.written", payloadRef: null,
         payload: { location, writer: relPath, callId }, causedBy: null, dedupeKey, createdAt: this.now().toISOString() });
     });
+    if (changed) await this.o.onSubstantiveProgress?.(taskId, `实际写入 ${location}`);
+  }
+
+  private businessModuleContext(version:TaskVersion,relPath:string):string[] {
+    if (!version.workModules?.length) return [];
+    return ["## 当前业务模块与协作边界",...version.workModules.filter(m=>m.leadRelPath===relPath||m.contributors?.includes(relPath)).map(m=>
+      `- [${m.id}] ${m.title}：${m.scope}；负责人 ${m.leadRelPath}；协作者 ${(m.contributors ?? []).join("、")||"无"}；依赖 ${(m.dependsOn ?? []).join("、")||"无"}；标准 ${m.criterionIds.join("、")}`),
+      ...(version.staffingRationale?[`配员与分批依据：${version.staffingRationale}`]:[])];
   }
 
   /** 任务会话登记（真实 sessionId → 角色） */
@@ -463,14 +548,23 @@ export class TaskService {
     if (input.executors.length === 0) throw new Error("至少需要一位执行专家");
     this.validateAssignments(input);
     this.validateRequiredTools(input.requiredTools);
+    this.validateRequiredTools(input.acceptorRequiredTools);
     const taskId = newId("task");
     const version: TaskVersion = {
+      ...(input.workKind?{workKind:input.workKind}:{}),
+      ...(input.verificationScope?{verificationScope:structuredClone(input.verificationScope)}:{}),
+      ...(input.verificationPolicyVersion?{verificationPolicyVersion:input.verificationPolicyVersion}:{}),
+      ...(input.verificationPlan ? {verificationPlan:structuredClone(input.verificationPlan)} : {}),
+      ...(input.executionPlanVersion ? {executionPlanVersion:input.executionPlanVersion}:{}),
+      ...(input.workModules ? {workModules:structuredClone(input.workModules)} : {}),
+      ...(input.staffingRationale ? {staffingRationale:input.staffingRationale} : {}),
       version: 1,
       goal: input.goal,
       criteria: input.criteria,
       deliverables: input.deliverables,
       executors: input.executors,
       ...(input.requiredTools ? { requiredTools: [...input.requiredTools] } : {}),
+      ...(input.acceptorRequiredTools ? {acceptorRequiredTools:[...input.acceptorRequiredTools]} : {}),
       ...(input.assignments ? { assignments: structuredClone(input.assignments) } : {}),
       acceptor: input.acceptor,
       budget: input.budget,
@@ -521,6 +615,12 @@ export class TaskService {
       if (!task) throw new Error(`任务不存在: ${taskId}`);
       if (task.status !== "proposed") throw new Error(`任务状态不可确认: ${task.status}`);
       const version = task.versions[task.currentVersion]!;
+      const verificationErrors=validateVerificationPlan(version);
+      if(verificationErrors.length)throw Error("验收实测计划未完整："+verificationErrors.join("；"));
+      const verificationIssue=this.o.verificationIssue?.(version);if(verificationIssue)throw Error(verificationIssue);
+      const capabilityIssue = this.o.acceptorToolIssue?.(version.acceptorRequiredTools ?? []);
+      if (capabilityIssue) throw new Error(capabilityIssue);
+      if(version.executionPlanVersion){const validation=validateExecutionPlan(version);if(!validation.valid)throw Error("职责/模块/批次计划未完整："+validation.errors.join("；"));}
       if (expectedVersion !== undefined && version.version !== expectedVersion) throw new Error("方案版本已变化，请重新核对后确认");
       if (routerSessionId) task.routerSessionId = routerSessionId;
       const existingBudget = data.collections.budgets?.[taskId] as TaskBudgetState | undefined;
@@ -616,6 +716,7 @@ export class TaskService {
   /** 用户修改方案后确认新版本（目标/标准/预算变化都走这里） */
   async proposeNewVersion(taskId: string, patch: Partial<ProposeInput>): Promise<TaskVersion> {
     this.validateRequiredTools(patch.requiredTools);
+    this.validateRequiredTools(patch.acceptorRequiredTools);
     let created: TaskVersion | undefined;
     await this.o.store.transact((data) => {
       const task = (data.collections[COLLECTION_TASKS] ??= {})[taskId] as Task | undefined;
@@ -623,12 +724,20 @@ export class TaskService {
       const prev = task.versions[task.currentVersion]!;
       const version: TaskVersion = {
         ...prev,
+        ...(patch.workKind?{workKind:patch.workKind}:{}),
+        ...(patch.verificationScope?{verificationScope:structuredClone(patch.verificationScope)}:{}),
+        ...(patch.verificationPlan!==undefined ? {verificationPlan:structuredClone(patch.verificationPlan)} : {}),
+        ...(patch.verificationPolicyVersion?{verificationPolicyVersion:patch.verificationPolicyVersion}:{}),
+        ...(patch.executionPlanVersion ? {executionPlanVersion:patch.executionPlanVersion}:{}),
+        ...(patch.workModules ? {workModules:structuredClone(patch.workModules)} : {}),
+        ...(patch.staffingRationale!==undefined ? {staffingRationale:patch.staffingRationale} : {}),
         version: prev.version + 1,
         goal: patch.goal ?? prev.goal,
         criteria: patch.criteria ?? prev.criteria,
         deliverables: patch.deliverables ?? prev.deliverables,
         executors: patch.executors ?? prev.executors,
         ...(patch.requiredTools !== undefined ? { requiredTools: [...patch.requiredTools] } : {}),
+        ...(patch.acceptorRequiredTools !== undefined ? {acceptorRequiredTools:[...patch.acceptorRequiredTools]} : {}),
         assignments: patch.assignments ?? prev.assignments,
         acceptor: patch.acceptor ?? prev.acceptor,
         budget: patch.budget ?? prev.budget,
@@ -694,6 +803,9 @@ export class TaskService {
         ownerRelPath,
         createdAt: this.now().toISOString(),
       };
+      if (task && contentHash && previous?.contentHash !== contentHash) {
+        (data.collections.truncationCounts ??= {})[`${taskId}:v${this.currentVersion(task).version}:${ownerRelPath}`] = 0;
+      }
     });
     // 只有内容真的变了才算实质进展：同一哈希重复登记不能刷新停滞计时
     if (contentHash && previous?.contentHash !== contentHash) {
@@ -741,6 +853,13 @@ export class TaskService {
   async dispatchPendingEvents(taskId: string, skipExecutors: ReadonlySet<string> = new Set(), reason?: string): Promise<number> {
     const task = this.getTask(taskId);
     if (!task) return 0;
+    if(["active","rework"].includes(task.status)&&this.getBatchProgress(taskId).length&&this.getBatchProgress(taskId).every(p=>p.currentBatch===null)){
+      let entered=false;
+      await this.o.store.transact(data=>{const t=data.collections[COLLECTION_TASKS]![taskId] as Task;if(!["active","rework"].includes(t.status)||this.currentVersion(t).version!==this.currentVersion(task).version)return;t.status="awaiting_acceptance";entered=true;});
+      if(!entered)return 0;
+      await this.runAcceptance(taskId,`modules-recovered:${taskId}:v${this.currentVersion(task).version}`);
+      return 1;
+    }
     const data = this.o.store.snapshot();
     const events = data.eventOrder
       .map((id) => data.events[id] as Record<string, unknown>)
@@ -754,6 +873,7 @@ export class TaskService {
       const dedupeKey = String(event["dedupeKey"]);
       let allGatesPassed = true;
       for (const expert of version.executors) {
+        if(this.executorModuleComplete(taskId,expert.relPath))continue;
         if (skipExecutors.has(expert.relPath)) continue;
         if (this.getExecutorDependency(taskId, expert.relPath).state === "waiting") continue;
         // 预算闸门先行：闸门失败（暂停）则中止本轮分派，事件保持未分派，恢复后重试
@@ -782,9 +902,68 @@ export class TaskService {
     return dispatchedCount;
   }
 
+  getBatchProgress(taskId:string) {
+    const task=this.getTask(taskId);if(!task)return [];
+    const v=this.currentVersion(task);if(!v.executionPlanVersion)return [];
+    return (v.assignments??[]).map(a=>{
+      const key=`${taskId}:v${v.version}:${a.relPath}`;
+      const completed=this.o.store.get<{completed:string[]}>("batchProgress",key)?.completed??[];
+      return {relPath:a.relPath,module:a.module,completed:[...completed],currentBatch:a.batches?.find(b=>!completed.includes(b.id))??null};
+    });
+  }
+
+  executorModuleComplete(taskId:string,relPath:string):boolean {
+    const p=this.getBatchProgress(taskId).find(p=>p.relPath===relPath);
+    return Boolean(p&&p.currentBatch===null);
+  }
+
+  private batchInstruction(taskId:string,relPath:string):string {
+    const p=this.getBatchProgress(taskId).find(p=>p.relPath===relPath),b=p?.currentBatch;
+    if(!b)return "本模块批次已全部完成，等待其余模块；不要重复执行。";
+    return [`模块：${p!.module}；已完成批次：${p!.completed.join("、")||"无"}`,`只执行当前批次 ${b.id}：${b.title}`,
+      ...b.deliverables.map(f=>`- ${f}`),"先用工具推进少量文件并落盘，不重复规划整个系统；大文件分段编辑。",
+      `完成本批后给出 <longtask_report>{"done":true,"batchId":"${b.id}","next":[],"waiting":null}</longtask_report>；未完成则done=false并说明当前批缺项。`].join("\n");
+  }
+
+  /** 完成一个已确认批次；文件存在且哈希匹配才推进，不拿口头done当成果。 */
+  private async completeBatch(task:Task,relPath:string,turnId:string,reportedId?:string):Promise<ContinuationDecision|null> {
+    const v=this.currentVersion(task),key=`${task.id}:v${v.version}:${relPath}`,action=`batch:${key}:${turnId}`;
+    if(this.o.store.findByDedupe(action))return null;
+    const p=this.getBatchProgress(task.id).find(p=>p.relPath===relPath),batch=p?.currentBatch;
+    if(!batch)return {action:"wait",reason:"expert_message",note:"本模块已完成，等待其余模块"};
+    const retry=(why:string):ContinuationDecision=>({action:"dispatch_next",steps:[why,this.batchInstruction(task.id,relPath)],note:"批次尚未通过齐备性检查"});
+    if(reportedId!==batch.id)return retry(`批次编号不匹配；当前是 ${batch.id}，不能跳批或省略batchId。`);
+    const missing=this.missingDeliverables(task.id,{...v,deliverables:batch.deliverables});
+    for(const file of batch.deliverables){
+      const artifact=this.currentArtifacts(task.id).find(a=>this.artifactLocationKey(a.location)===this.artifactLocationKey(file));
+      if(!artifact?.contentHash||artifact.ownerRelPath!==relPath||(this.o.verifyArtifact&&!await this.o.verifyArtifact(file,artifact.contentHash)))missing.push(file);
+    }
+    if(missing.length)return retry(`本批文件未齐备或版本已变：${[...new Set(missing)].join("、")}`);
+    await this.o.store.transact(data=>{
+      const fresh=data.collections[COLLECTION_TASKS]?.[task.id] as Task|undefined;
+      if(!fresh||!["active","rework"].includes(fresh.status)||this.currentVersion(fresh).version!==v.version)throw Error("批次核对期间任务已停止或版本变化");
+      const table=(data.collections.batchProgress??={});table[key]={completed:[...p!.completed,batch.id]};
+      data.appendEvent({eventId:newId("evt"),taskId:task.id,taskVersion:v.version,source:"worker",type:"task.batch_completed",payloadRef:null,
+        payload:{relPath,batchId:batch.id,files:batch.deliverables},causedBy:null,dedupeKey:action,createdAt:this.now().toISOString()});
+    });
+    await this.o.onSubstantiveProgress?.(task.id,`模块 ${p!.module} 批次 ${batch.id} 已落盘`);
+    if(!this.executorModuleComplete(task.id,relPath)){
+      if(this.getExecutorDependency(task.id,relPath).state==="waiting"){
+        await this.recordDependencyWaits(task.id);
+        return {action:"wait",reason:"expert_message",note:"本批已落盘，下一批等待前置业务模块完成，不提前接续"};
+      }
+      return {action:"dispatch_next",steps:[this.batchInstruction(task.id,relPath)],note:"本批已落盘，按顺序推进下一批"};
+    }
+    if(this.getBatchProgress(task.id).every(p=>p.currentBatch===null))return {action:"submit_acceptance",note:"全部模块批次已完成，提交独立验收"};
+    return {action:"wait",reason:"expert_message",note:"本模块已完成，等待其余模块批次交齐"};
+  }
+
   /** 执行者任务简报：目标、标准、交付物、专家定义全文、报告协议（P1-5） */
   private async renderExecutorBrief(task: Task, expert: ExpertRef): Promise<string> {
     const version = this.currentVersion(task);
+    const assignment=version.executionPlanVersion?version.assignments?.find(a=>a.relPath===expert.relPath):undefined;
+    const criteria=assignment?version.criteria.filter(c=>assignment.criterionIds?.includes(c.id)):version.criteria;
+    const batch=assignment?this.getBatchProgress(task.id).find(p=>p.relPath===expert.relPath)?.currentBatch:undefined;
     const definition = this.o.loadExpert ? await this.o.loadExpert(expert) : `（专家定义未配置：${expert.name} — ${expert.intro}）`;
     const est = this.estimates();
     return [
@@ -796,20 +975,25 @@ export class TaskService {
       "## 任务目标",
       version.goal,
       "",
-      "## 完成标准（逐项核对，缺一不可）",
-      ...version.criteria.map((c) => `- [${c.id}] ${c.text}`),
+      assignment?`## 你的模块：${assignment.module}（职责：${assignment.responsibilities?.join("、")}）`:"## 完成标准（逐项核对，缺一不可）",
+      ...(assignment?["以下只检查你负责的模块；整任务完成由全部模块交齐后独立验收，不要求你实现其他人的模块。",...(assignment.coverageRationale?[`兼任安排：${assignment.coverageRationale}`]:[])]:[]),
+      ...criteria.map((c) => `- [${c.id}] ${c.text}`),
+      ...this.businessModuleContext(version,expert.relPath),
       "",
       "## 交付物",
-      ...(version.assignments?.find((a) => a.relPath === expert.relPath)?.deliverables ?? version.deliverables).map((d) => `- ${d}`),
+      ...(taskWorkKind(version.goal,version.workKind)==="verification" ? ["这是已有系统复验。既有测试脚本作为输入，无需冒充新增源码；报告明确实际运行范围及未覆盖的浏览器、安装链和环境。HTTP 200不代表浏览器交互通过。保留可运行检查与原始输出，清理仅限本轮创建的资源。"]:[]),
+      ...(version.verificationScope?[`用户确认的验收范围：${JSON.stringify(version.verificationScope)}`]:[]),
+      ...(batch?.deliverables??version.assignments?.find((a) => a.relPath === expert.relPath)?.deliverables ?? version.deliverables).map((d) => `- ${d}`),
+      ...(batch?[`当前只执行批次 ${batch.id}：${batch.title}。此批最多4个文件，先调用工具落盘，不预写后续批次的代码。`,"每次工具调用只做一个可核对的文件/局部修改；大文件分段edit，不在一次调用中拼出整个项目。",`批次路线：${assignment!.batches!.map(b=>`${b.id} ${b.title}`).join(" → ")}`]:[]),
       ...(version.assignments ? ["以上是你负责的交付物；其余交付物由对应执行者负责。交接就绪后再处理自己的分工。"] : []),
       "请使用可用工具把交付物实际写入上述路径（绝对路径）。仅口头描述不算完成。",
       "",
       "## 每轮结束时的报告协议（必须遵守）",
       "在回复末尾输出一个 JSON 块：",
       "<longtask_report>",
-      '{"done": false, "next": ["具体下一步"], "waiting": null}',
+      batch?`{"done": false, "batchId": "${batch.id}", "next": ["当前批次的具体下一步"], "waiting": null}`:'{"done": false, "next": ["具体下一步"], "waiting": null}',
       "</longtask_report>",
-      '- done: 本轮是否已达成全部完成标准（true 将触发独立验收）',
+      batch?'- done: 当前批次是否完成。完成时done=true并带当前batchId；插件核对文件后推进下一批，全部模块齐备才触发独立验收。':'- done: 本轮是否已达成全部完成标准（true 将触发独立验收）',
       "- next: 尚可执行的具体缺项（done=false 时必填）",
       "- waiting: 正在等待的外部对象（后台命令/另一位专家），无则 null",
       "缺少该 JSON 块将被视为本轮未声明完成；声明 done=true 前请逐条确认完成标准均已满足。",
@@ -835,12 +1019,13 @@ export class TaskService {
       "",
       "## 收敛纪律（预算硬约束，违反会直接烧光预算）",
       "- 先落盘第一版交付物，再迭代补细节；不要先通读资料再动笔。",
-      "- 读文件/检索/列目录合计不超过 6 次；超了会被插件打断，且每次读取都会永久留在上下文里，让后面每一步都更贵。",
-      "- 交付物面向读者，不需要为核对内部实现去读源码；按简报里已有信息写清楚即可。",
-      `- 本会话最多执行 ${this.maxExecutorSteps()} 步；用尽会暂停交人工，不会自动加额。`,
+      "- 按当前模块需要读取源码、资料和测试结果；不设固定读取次数硬上限。优先定向检索，避免重复读取与无关全文进入上下文。",
+      "- 实现或修复前核对相关源码和接口，完成后验证实际结果；依据原预算与当前批次推进。",
+      this.maxExecutorSteps()>0?`- 本会话最多执行 ${this.maxExecutorSteps()} 步；用尽会暂停交人工，不会自动加额。`
+        : "- 不设固定累计执行步数上限；有实际进展时按当前批次继续，仍受用户预算、停滞检测与独立验收约束，不会自动加额。",
       "- 交付物文件若已存在且内容可用，直接在其上修改，不要整篇重写。",
       "",
-      `## 预算约束（每次请求预估 ≤ 输入 ${est.inputTokens} + 输出 ${est.outputTokens} Token）`,
+      est.outputTokens===0?"## 预算约束（单次输出上限跟随DSH，实际请求前按最终上限预留）":`## 预算约束（每次请求预估 ≤ 输入 ${est.inputTokens} + 输出 ${est.outputTokens} Token）`,
       ...(version.budget.money ? [`用户批准的总上限：¥${version.budget.money.limitAmount}；按模型价格核算，不是平台实扣。执行、协作、验收及返工共用本任务金额，不得自行追加。`] : []),
       "预算耗尽任务将自动暂停；请避免无产出的大段输出。",
     ].join("\n");
@@ -848,6 +1033,7 @@ export class TaskService {
 
   /** 预算闸门 + 投递。返回 reservationId；被闸门拒绝返回 null。 */
   private async gatedDeliver(task: Task, expert: ExpertRef, dedupeKey: string, content: string, purpose: string, target: "next-turn" | "next-step" = "next-turn"): Promise<string | null> {
+    if(this.executorModuleComplete(task.id,expert.relPath))return null;
     const gate = await this.gateDispatch(task.id, purpose);
     if (!gate.ok) return null;
     const record = await this.sendToExecutor(task, expert.relPath, dedupeKey, content, gate.reservationId, target);
@@ -866,6 +1052,7 @@ export class TaskService {
     if (this.getExecutorDependency(task.id, relPath).state === "waiting" && (!dependencyMessage || !this.matchesDependency(task, relPath, dependencyMessage))) {
       return this.failedRecord(task.id, relPath, dedupeKey, content, reservationId, "executor-dependency-waiting");
     }
+    if(!await this.verifyModuleInputs(task.id,relPath))return this.failedRecord(task.id,relPath,dedupeKey,content,reservationId,"module-inputs-changed");
     const expert = this.findExpert(task, relPath);
     const sessions = this.getSessions(task.id);
     let lease: TaskSessionRecord | undefined;
@@ -903,13 +1090,18 @@ export class TaskService {
     if (!stillDispatchable()) return abort("dispatch-cancelled");
     // 新会话没有上文：必须带上完整简报，否则它只收到一句"继续执行缺项"，
     // 手里没有目标/标准/交付物，只能重新问一遍——这正是恢复后重复消耗的来源。
+    const version=this.currentVersion(task);
+    const moduleContext=this.businessModuleContext(version,relPath);
+    const planHash=createHash("sha256").update(JSON.stringify({version:version.version,moduleContext})).digest("hex");
+    const refreshContext=this.deliveredPlanContexts.get(lease.sessionKey)!==planHash;
     const payload = freshSession
       ? `${await this.renderExecutorBrief(task, expert)}\n\n---\n\n## 当前指令\n${content}`
-      : content;
+      : version.executionPlanVersion ? [content,...(refreshContext?moduleContext:[]),this.batchInstruction(task.id,relPath)].join("\n\n") : content;
     // 渲染简报会 await 专家定义加载；这一步之后必须再复核一次
     if (!stillDispatchable()) return abort("dispatch-cancelled-after-load");
     await this.o.onInstruction?.(task.id, content);
     const delivery = await this.o.host.deliver(lease.sessionKey, payload, dedupeKey, target);
+    if (delivery==="delivered") this.deliveredPlanContexts.set(lease.sessionKey,planHash);
     const record: MessageRecord = {
       id: newId("msg"),
       taskId: task.id,
@@ -992,11 +1184,63 @@ export class TaskService {
    * 状态转换以幂等事件落盘（dedupeKey 含轮次与原因），重复送达不重复触发。
    */
   async onTurnEnd(taskId: string, executorRelPath: string, endKind: TurnEndKind, turnId: string): Promise<ContinuationDecision | null> {
-    if (this.getExecutorDependency(taskId, executorRelPath).state === "waiting") {
-      return { action: "wait", reason: "expert_message", note: "事件到达时前置交接尚未送达，不处理提前完成报告" };
-    }
     // 同一结束事件并发重放时必须串行：先查后写会让两条路径同时进入派工
-    return this.withTaskLock(taskId, () => this.onTurnEndLocked(taskId, executorRelPath, endKind, turnId));
+    return this.withTaskLock(taskId,async()=>{
+      const result=await this.onTurnEndLocked(taskId,executorRelPath,endKind,turnId);
+      await this.handoffCompletedModulesLocked(taskId);return result;
+    });
+  }
+
+  private async handoffCompletedModulesLocked(taskId:string):Promise<Set<string>> {
+    const notified=new Set<string>(),task=this.getTask(taskId);
+    if(!task||!["active","rework"].includes(task.status))return notified;
+    const v=this.currentVersion(task);
+    for(const a of v.assignments??[]){
+      const dep=a.waitFor;if(!dep||!this.executorModuleComplete(taskId,dep.fromRelPath)||this.getExecutorDependency(taskId,a.relPath).state!=="waiting")continue;
+      let valid=true;
+      for(const file of dep.artifactRefs){const artifact=this.currentArtifacts(taskId).find(x=>this.artifactLocationKey(x.location)===this.artifactLocationKey(file));if(!artifact?.contentHash||(this.o.verifyArtifact&&!await this.o.verifyArtifact(file,artifact.contentHash)))valid=false;}
+      if(!valid){await this.pause(taskId,"missing_input","前置模块交接文件缺失或内容已变，请核对产物版本后恢复；未派工下游。");return notified;}
+      const result=await this.sendExpertMessageLocked(taskId,dep.fromRelPath,a.relPath,"前置模块已完成，请读取交接文件并按自己的当前批次执行。",{artifactRefs:dep.artifactRefs,actionId:`module-handoff-v${v.version}-${dep.fromRelPath}-${a.relPath}`});
+      if(result.delivery==="delivered")notified.add(a.relPath);
+    }
+    // 业务模块可跨多个专家或同一专家的多个批次。只释放当前批次的全部前置条件，
+    // 不等待来源专家全部工作结束，也不靠一条普通交接消息跳过其他前置模块。
+    for(const a of v.assignments??[]){
+      if(this.getTask(taskId)?.status!==task.status)break;
+      const batch=this.getBatchProgress(taskId).find(p=>p.relPath===a.relPath)?.currentBatch;
+      const prerequisites=this.modulePrerequisites(taskId,a.relPath);
+      if(!batch||!prerequisites.length||this.getExecutorDependency(taskId,a.relPath).state!=="ready")continue;
+      const waitKey=JSON.stringify([taskId,v.version,a.relPath,batch.id]);
+      const queued=this.o.store.get<{generation:number;status:string}>("moduleDependencyDispatches",waitKey);
+      if(queued?.status!=="waiting")continue;
+      const hashes:Record<string,string>={};let valid=true;
+      for(const file of new Set(prerequisites.flatMap(d=>d.deliverables))){
+        const artifact=this.currentArtifacts(taskId).find(x=>this.artifactLocationKey(x.location)===this.artifactLocationKey(file));
+        if(!artifact?.contentHash||(this.o.verifyArtifact&&!await this.o.verifyArtifact(file,artifact.contentHash))){valid=false;break;}
+        hashes[file]=artifact.contentHash;
+      }
+      if(!valid){await this.pause(taskId,"missing_input","业务模块依赖产物缺失或版本已变，请核对后恢复；未派工下游。");return notified;}
+      const key=`module-ready:${taskId}:v${v.version}:${a.relPath}:${batch.id}:${queued.generation}:${createHash("sha256").update(JSON.stringify(hashes)).digest("hex")}`;
+      let delivered=notified.has(a.relPath)||this.o.store.list<MessageRecord>(COLLECTION_MESSAGES).some(m=>m.taskId===taskId&&m.dedupeKey===key&&m.delivery==="delivered");
+      if(!delivered){
+        const gate=await this.gateDispatch(taskId,"业务模块依赖就绪");if(!gate.ok)return notified;
+        const record=await this.sendToExecutor(this.getTask(taskId)!,a.relPath,key,["前置业务模块的当前版本批次已完成；读取以下产物后执行自己的当前批次。",`依赖产物版本：${JSON.stringify(hashes)}`,this.batchInstruction(taskId,a.relPath)].join("\n"),gate.reservationId);
+        if(record.delivery==="unknown"){await this.pause(taskId,"missing_input","业务模块唤醒投递结果未知，请先核对原会话，禁止盲目重投。");return notified;}
+        if(record.delivery==="failed"){
+          if(["active","rework"].includes(this.getTask(taskId)?.status??""))await this.pause(taskId,"missing_input","业务模块唤醒未送达，已保留待投递检查点；核对后恢复可重试，不会把失败记为已执行。");
+          return notified;
+        }
+        delivered=record.delivery==="delivered";
+      }
+      if(delivered){
+        await this.o.store.transact(data=>{
+          (data.collections.moduleDependencyDispatches??={})[waitKey]={generation:queued.generation,status:"delivered"};
+          this.wakeWaitsInTx(data,taskId,`dependency:${a.relPath}`,"module_dependency_ready",this.now().toISOString());
+          this.wakeWaitsInTx(data,taskId,`executor-reply:${a.relPath}`,"module_dependency_ready",this.now().toISOString());
+        });notified.add(a.relPath);
+      }
+    }
+    return notified;
   }
 
   private async onTurnEndLocked(taskId: string, executorRelPath: string, endKind: TurnEndKind, turnId: string): Promise<ContinuationDecision | null> {
@@ -1034,7 +1278,18 @@ export class TaskService {
     } else if (endKind === "completed") await this.o.store.transact(data => {
       (data.collections.truncationCounts ??= {})[`${taskId}:v${this.currentVersion(task).version}:${executorRelPath}`] = 0;
     });
-    const decision = decideAfterTurnEnd(turnCtx, endKind);
+    const planned=this.currentVersion(task).executionPlanVersion;
+    if(planned&&this.executorModuleComplete(taskId,executorRelPath))return null;
+    const decision = planned&&endKind==="completed"&&turnCtx.claimedDone&&!turnCtx.activeCommand&&!turnCtx.pendingBackgroundResults&&!turnCtx.pendingReply&&!turnCtx.unhandledEvent
+      ? await this.completeBatch(task,executorRelPath,turnId,turnCtx.completedBatchId)
+      : decideAfterTurnEnd(turnCtx, endKind);
+    if(!decision)return null;
+    if (endKind === "completed" && !(decision.action === "stop" && decision.reason === "no_work")) {
+      await this.o.store.transact(data => {
+        delete data.collections.missingReportStates?.[`${taskId}:v${this.currentVersion(task).version}:${executorRelPath}`];
+      });
+    }
+    if(planned&&decision.action==="dispatch_next"&&endKind==="max-tokens")decision.steps=["单次输出被截断。先核对已完成文件和工具结果，不重复长篇规划，不重跑已完成命令。",this.batchInstruction(taskId,executorRelPath)];
     if (decision.action !== "wait") {
       await this.o.store.transact(data => {
         this.wakeWaitsInTx(data, taskId, `executor-reply:${executorRelPath}`, "executor_progress", this.now().toISOString());
@@ -1105,8 +1360,11 @@ export class TaskService {
     if (decision.action === "submit_acceptance") {
       const dedupeKey = `accept:${taskId}:turn:${turnId}`;
       if (!this.o.store.findByDedupe(dedupeKey)) {
+        let accepted=false;
         await this.o.store.transact((data) => {
           const t = (data.collections[COLLECTION_TASKS] ??= {})[taskId] as Task;
+          if(planned&&(!["active","rework"].includes(t.status)||this.currentVersion(t).version!==this.currentVersion(task).version))return;
+          accepted=true;
           t.status = "awaiting_acceptance";
           t.updatedAt = this.now().toISOString();
           data.appendEvent({
@@ -1122,7 +1380,7 @@ export class TaskService {
             createdAt: this.now().toISOString(),
           });
         });
-        await this.runAcceptance(taskId, dedupeKey, executorRelPath);
+        if(accepted)await this.runAcceptance(taskId, dedupeKey, executorRelPath);
       }
       return decision;
     }
@@ -1207,18 +1465,17 @@ export class TaskService {
    * 催过还缺就暂停交人工。绝不能什么都不做——那会让任务永远停在 active。
    */
   private async handleMissingReport(taskId: string, executorRelPath: string, turnId: string): Promise<void> {
-    // 按任务去重（不是按轮次）：催办若被忽略，下一轮又是新的 turnId，
-    // 按轮次去重会无限催办下去。每个任务只给一次补报告的机会，第二次直接交人工。
-    const nudgeKey = `report-nudge:${taskId}`;
-    if (!this.claimOnce(nudgeKey)) {
-      await this.pause(
-        taskId,
-        "missing_input",
-        "执行者本轮以 completed 结束，但没有给出可解析的 <longtask_report> 报告块；已催办一次仍缺失，交人工判断",
-      );
-      return;
-    }
-    if (this.o.store.findByDedupe(nudgeKey) || this.messageDelivered(nudgeKey)) {
+    const task = this.getTask(taskId)!;
+    const scope = `${taskId}:v${this.currentVersion(task).version}:${executorRelPath}`;
+    const eventKey = `missing-report:${scope}:${turnId}`;
+    if (this.o.store.get("missingReportEvents", eventKey)) return;
+    const pending = this.o.store.get("missingReportStates", scope);
+    await this.o.store.transact(data => {
+      (data.collections.missingReportEvents ??= {})[eventKey] = {taskId, turnId};
+      (data.collections.missingReportStates ??= {})[scope] = {taskId, turnId};
+    });
+    const nudgeKey = `report-nudge:${scope}:${turnId}`;
+    if (pending) {
       await this.pause(
         taskId,
         "missing_input",
@@ -1262,16 +1519,16 @@ export class TaskService {
     );
   }
 
-  /** 验收步数上限（缺口由配置注入，缺省 8） */
+  /** 可选显式硬上限；默认按实际核对进展和原预算续验收。 */
   private maxAcceptanceSteps(): number {
     const n = this.o.acceptorMaxSteps;
-    return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 8;
+    return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : 0;
   }
 
-  /** 执行步数上限（缺省 24）：执行者的探索同样必须有界，否则只能靠预算兜底 */
+  /** 用户可选的执行步数上限；默认0表示由预算和实质进展控制。 */
   private maxExecutorSteps(): number {
     const n = this.o.executorMaxSteps;
-    return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 24;
+    return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
   }
 
   /**
@@ -1318,10 +1575,12 @@ export class TaskService {
   ): Promise<void> {
     const dedupeKey = `missing-deliverables:${taskId}:${causedByDedupe}`;
     if (this.o.store.findByDedupe(dedupeKey)) return;
+    const repairModules=version.executionPlanVersion?(version.assignments??[]).filter(a=>a.deliverables.some(f=>missing.some(m=>this.artifactLocationKey(f)===this.artifactLocationKey(m)))):[];
     await this.o.store.transact((data) => {
       const t = (data.collections[COLLECTION_TASKS] ??= {})[taskId] as Task;
       t.status = "rework";
       t.updatedAt = this.now().toISOString();
+      for(const a of repairModules){(data.collections.batchProgress??={})[`${taskId}:v${version.version}:${a.relPath}`]={completed:[]};this.wakeWaitsInTx(data,taskId,`executor-reply:${a.relPath}`,"missing_module_files",t.updatedAt);}
       data.appendEvent({
         eventId: newId("evt"),
         taskId,
@@ -1336,6 +1595,11 @@ export class TaskService {
       });
     });
     const fresh = this.getTask(taskId)!;
+    if(repairModules.length){
+      for(const a of repairModules)await this.gatedDeliver(fresh,this.findExpert(fresh,a.relPath),`${dedupeKey}:${a.relPath}`,
+        `模块文件缺失，验收尚未启动；先核对并只修复缺失文件：${missing.filter(m=>a.deliverables.some(f=>this.artifactLocationKey(f)===this.artifactLocationKey(m))).join("、")}\n${this.batchInstruction(taskId,a.relPath)}`,"模块文件缺失退回");
+      return;
+    }
     const owner = version.executors[0]!.relPath;
     await this.gatedDeliver(
       { ...fresh, status: "rework" },
@@ -1400,21 +1664,19 @@ export class TaskService {
   async recordAcceptorProgress(
     taskId: string,
     roundId: string,
-    patch: { steps?: number; lastSummary?: string; checkedCriteria?: string[] },
+    patch: { steps?: number; lastSummary?: string; checkedCriteria?: string[]; stepEpoch?: number },
   ): Promise<void> {
-    const round = this.o.store.get<AcceptanceRound>(COLLECTION_ROUNDS, roundId);
-    if (!round || round.state !== "pending") return;
-    const prev = round.checkpoint;
-    const checked = new Set([...(prev?.checkedCriteria ?? []), ...(patch.checkedCriteria ?? [])]);
-    const next: AcceptanceCheckpoint = {
-      steps: Math.max(prev?.steps ?? 0, patch.steps ?? 0),
-      lastSummary: (patch.lastSummary ?? prev?.lastSummary ?? "").slice(0, 1500),
-      checkedCriteria: [...checked],
-      updatedAt: this.now().toISOString(),
-    };
     await this.o.store.transact((data) => {
       const stored = (data.collections[COLLECTION_ROUNDS] ??= {})[roundId] as AcceptanceRound | undefined;
-      if (stored && stored.state === "pending") stored.checkpoint = next;
+      if (!stored || stored.taskId!==taskId || stored.state!=="pending") return;
+      const prev=stored.checkpoint;
+      if (patch.stepEpoch!==undefined && patch.stepEpoch!==(prev?.stepEpoch ?? 0)) return;
+      stored.checkpoint={
+        stepEpoch:prev?.stepEpoch ?? 0,steps:Math.max(prev?.steps ?? 0,patch.steps ?? 0),
+        lastSummary:(patch.lastSummary ?? prev?.lastSummary ?? "").slice(0,1500),
+        checkedCriteria:[...new Set([...(prev?.checkedCriteria ?? []),...(patch.checkedCriteria ?? [])])],
+        updatedAt:this.now().toISOString(),
+      };
     });
   }
 
@@ -1441,6 +1703,34 @@ export class TaskService {
       ].join("\n"),
     });
     return true;
+  }
+
+  async continueTruncatedAcceptance(taskId: string, roundId: string, turnId: string): Promise<void> {
+    const task = this.getTask(taskId);
+    if (task?.status !== "awaiting_acceptance" || this.latestPendingRound(taskId)?.roundId !== roundId) return;
+    const key = `acceptance-truncated:${roundId}:${turnId}`;
+    if (this.messageDelivered(key)) return;
+    await this.deliverAcceptanceRequest(taskId, roundId, key, {
+      note: "上一轮验收输出被截断。依据检查点继续尚未核对的标准，不重复已完成核对，最后给出完整 <longtask_verdicts>。仍受本轮剩余步数和原预算约束。",
+    });
+  }
+
+  async continueAcceptanceAfterToolRefresh(taskId:string,roundId:string,eventId:string,oldSessionId:string,epoch:number):Promise<void> {
+    if(this.getTask(taskId)?.status!=="awaiting_acceptance"||this.latestPendingRound(taskId)?.roundId!==roundId)return;
+    const key=`acceptance-tools:${roundId}:${eventId}`;
+    if(this.messageDelivered(key))return;
+    let replaced=false;
+    await this.o.store.transact(data=>{
+      const task=data.collections[COLLECTION_TASKS]?.[taskId] as Task|undefined;
+      const round=data.collections[COLLECTION_ROUNDS]?.[roundId] as AcceptanceRound|undefined;
+      if(task?.status!=="awaiting_acceptance"||round?.state!=="pending"||(round.checkpoint?.stepEpoch??0)!==epoch)return;
+      for(const session of Object.values(data.collections[COLLECTION_SESSIONS]?.[taskId]??{}) as TaskSessionRecord[]){
+        if(session.sessionId===oldSessionId&&!session.revokedAt){session.revokedAt=this.now().toISOString();replaced=true;}
+      }
+    });
+    if(!replaced)return;
+    // blocked结束期间向同一Agent排队可能被宿主清空；新会话从相同检查点生成全新ToolSet。
+    await this.deliverAcceptanceRequest(taskId,roundId,key,{note:"验收读取工具现已就绪，上一轮旧工具快照未发起模型请求。请从检查点继续，直接读取产物并给出独立验收结论。"});
   }
 
   /** 该投递键是否已落过消息（宿主的去重不可信，本地必须有记录） */
@@ -1501,6 +1791,10 @@ export class TaskService {
       "",
       "## 待核对标准（逐项核对，逐项给结论，不可遗漏）",
       ...version.criteria.map((c) => `- [${c.id}] ${c.text}`),
+      ...(version.verificationScope?[`用户确认的验收包含/排除范围：${JSON.stringify(version.verificationScope)}`,"只签署本轮覆盖的结论；HTTP资源200不能替代浏览器交互，既有依赖上的启动不能替代干净安装。"]:[]),
+      ...(version.verificationPlan ? ["## 实测计划与证据要求",JSON.stringify(verificationReview(version)),`独立验收负责人：${version.acceptor.relPath}；通过${VERIFICATION_TOOL}按checkId执行已确认检查：`,JSON.stringify(version.verificationPlan),
+        "测试和浏览器脚本在临时副本中运行，原交付源码保持只读。命令检查须实际断言接口/启动/测试结果；browser检查须实际启动浏览器操作页面并检查控制台，不得用打印通过替代。每条pass须在verificationRunIds列出对应真实成功运行ID。"] : []),
+      ...(version.workModules?.length ? ["## 业务模块责任矩阵",...version.workModules.map(m=>`- [${m.id}] ${m.title}：${m.scope}；负责人 ${m.leadRelPath}；协作者 ${(m.contributors ?? []).join("、")||"无"}；完成标准 ${m.criterionIds.join("、")}`)] : []),
       "",
       "## 核对范围（硬约束，违反即视为无效结论）",
       ...(artifactFiles.length > 0
@@ -1513,14 +1807,17 @@ export class TaskService {
             "- 注意：本会话没有工具级只读限制。下面的「只读、不写、不删」是纪律要求，不是技术拦截；" +
               "如果你已经写了文件，必须在结论里如实说明。",
           ]),
-      "- 除读取上面列出的产物外，不写、不删、不移动、不重命名任何文件；不安装依赖；不做耗时命令。",
+      version.verificationPlan ? "- 原交付目录不写、不删、不移动、不重命名，不在原目录安装依赖。实测使用longtask_verify：仅在临时副本和宿主沙箱中执行已确认的命令/浏览器脚本，不能临时改命令。能力不足明确判gapKind=capability，不能静态替代实测。" : "- 除读取上面列出的产物外，不写、不删、不移动、不重命名任何文件；不安装依赖；不做耗时命令。",
       // P2-8：不得用一句话改写任务语义。标准要求事实/数据正确时，验收人必须真的核对。
       "- 判定范围以标准条文为准：条文要求事实、数据、引用正确时，必须核对到足以支撑结论；条文只要求产物存在或结构完整时，不要额外为背景资料检索。",
-      "- 需要核对但当前会话确实无法核对的（无联网、无权限、无对应数据源）：该条判 gap 并写明「无法核对」，不得写成 pass。",
+      `- 先按标准定向核对，首轮以约${(this.o.acceptanceReadBudgetBytes ?? 65_536)/1024}KiB读取量规划；大文件使用分页、表头、索引或抽样，确需扩大范围时按剩余预算继续。`,
+      "- 需要核对但当前会话确实无法核对的（无联网、无权限、无对应数据源或无法运行测试）：该条判 gap、gapKind=capability，并说明需要的工具/权限/数据源；插件会暂停补齐验收能力，不把它当产物缺陷反复返工。不得写成 pass。",
       "- 遇到沙箱/权限报错（sandbox、permission、EPERM、BLOCKED 等）：立即停止该操作，那不是缺项证据，改用已读到的内容判定。",
       "- 产物文件不存在或读不出：该标准直接判 gap 并说明，不要换路径/换工具反复尝试。",
       "- 一次性给出全部结论；已经有足够信息时不要再调用任何工具。",
-      `- 本会话最多 ${stepCap} 步（已用 ${usedSteps} 步）；超出将由人工接管。`,
+      stepCap>0?`- 本会话最多 ${stepCap} 步（已用 ${usedSteps} 步）；超出将由人工接管。`
+        :`- 不设固定累计验收步数硬上限（已用 ${usedSteps} 步）；每 ${this.o.acceptorProgressWindowSteps??8} 步记录检查点，取得新的读取/核对证据则在原预算内继续。`,
+      `- 连续 ${this.o.acceptorMaxIdleSteps??3} 步无新的核对证据会先纠偏，仍无进展则暂停。切换目录、报错与重复读取相同片段不算进展。`,
       ...(checkpoint && (checkpoint.checkedCriteria.length > 0 || checkpoint.lastSummary)
         ? [
             "",
@@ -1539,6 +1836,7 @@ export class TaskService {
           criterionId: c.id,
           outcome: "pass",
           evidence: "证据引用",
+          ...(version.verificationPlan?{verificationRunIds: []}:{}),
           gap: null,
           verdictBy: version.acceptor.relPath,
           criteriaVersion: version.version,
@@ -1590,11 +1888,11 @@ export class TaskService {
    * - 产物哈希必须以冻结集合为基准完整匹配（漏项、未知键、错值都拒绝）
    * - 磁盘上的产物必须仍等于冻结版本（不只信模型回传的哈希）
    */
-  async recordVerdicts(taskId: string, verdicts: Verdict[], artifactHashes: Record<string, string>, roundId: string): Promise<"delivered" | "rework"> {
+  async recordVerdicts(taskId: string, verdicts: Verdict[], artifactHashes: Record<string, string>, roundId: string): Promise<"delivered" | "rework" | "paused"> {
     return this.withTaskLock(taskId, () => this.recordVerdictsLocked(taskId, verdicts, artifactHashes, roundId));
   }
 
-  private async recordVerdictsLocked(taskId: string, verdicts: Verdict[], artifactHashes: Record<string, string>, roundId: string): Promise<"delivered" | "rework"> {
+  private async recordVerdictsLocked(taskId: string, verdicts: Verdict[], artifactHashes: Record<string, string>, roundId: string): Promise<"delivered" | "rework" | "paused"> {
     if (this.o.ledger.accountingIssue(taskId)) throw new Error("模型费用尚未核对，不能交付或返工");
     // 幂等在最前：同一轮验收结论重复送达时，不因轮次已结算/状态已流转而误拒
     const existing = this.getTask(taskId);
@@ -1628,8 +1926,11 @@ export class TaskService {
     }
     for (const v of verdicts) {
       if (!version.criteria.some((c) => c.id === v.criterionId)) errors.push(`未知标准 ID: ${v.criterionId}`);
+      if(!["pass","gap"].includes(v.outcome))errors.push(`标准 [${v.criterionId}] outcome无效`);
+      if(v.verificationRunIds!==undefined&&(!Array.isArray(v.verificationRunIds)||v.verificationRunIds.some(id=>typeof id!=="string")))errors.push(`标准 [${v.criterionId}] verificationRunIds无效`);
       if (!v.evidence || v.evidence.trim() === "") errors.push(`标准 [${v.criterionId}] 证据为空`);
       if (v.outcome === "gap" && (!v.gap || v.gap.trim() === "")) errors.push(`标准 [${v.criterionId}] 缺项说明为空`);
+      if (v.gapKind !== undefined && !["deliverable","capability"].includes(v.gapKind)) errors.push(`标准 [${v.criterionId}] 缺项类型无效`);
       if (v.verdictBy !== version.acceptor.relPath) {
         errors.push(`结论签署人 ${v.verdictBy} 不是已配置的独立验收人 ${version.acceptor.relPath}`);
       }
@@ -1669,6 +1970,26 @@ export class TaskService {
     }
     if (errors.length > 0) throw new Error(`验收结论无效：\n- ${errors.join("\n- ")}`);
 
+    const verificationRuns:VerificationRun[]=[];
+    for(const run of this.o.store.list<VerificationRun>(VERIFICATION_RUNS)){
+      if(run.taskId!==taskId||!verdicts.some(v=>v.verificationRunIds?.includes(run.id))||!this.getSessions(taskId).some(s=>s.sessionId===run.sessionId&&s.role==="acceptor"&&!s.revokedAt))continue;
+      if(version.verificationPlan&&await verifyRunInputs(run,version.verificationPlan))verificationRuns.push(run);
+    }
+    const missing=missingVerification(version,verdicts,verificationRuns,roundId,round.checkpoint?.stepEpoch??0,frozen);
+    if(missing.length){
+      await this.recordAcceptorProgress(taskId,roundId,{lastSummary:`待实测，不能交付：${missing.join("；")}`});
+      await this.pause(taskId,"missing_input",`待实测，验收pass缺少真实执行证据；保留本轮，不把能力缺口派为代码返工：\n${missing.join("\n")}`);
+      return "paused";
+    }
+
+    const capabilityGaps = verdicts.filter(v=>v.outcome==="gap"&&v.gapKind==="capability");
+    if (capabilityGaps.length) {
+      const note = capabilityGaps.map(v=>`[${v.criterionId}] ${v.gap}；${v.evidence}`).join("\n");
+      await this.recordAcceptorProgress(taskId,roundId,{lastSummary:`验收能力待补齐：${note}`});
+      await this.pause(taskId,"missing_input",`验收能力不足，保留当前轮次，不派工修改产物。请补齐受控工具、权限或数据源后恢复：\n${note}`);
+      return "paused";
+    }
+
     const dedupeKey = `verdict:${roundId}`; // 顶部已做幂等检查；此处仅保留键值供落盘
 
     const allPass = verdicts.every((v) => v.outcome === "pass");
@@ -1684,16 +2005,23 @@ export class TaskService {
       if (!storedRound || storedRound.state !== "pending") {
         throw new Error(`验收轮次 ${roundId} 已失效（状态 ${storedRound?.state ?? "缺失"}），结论作废`);
       }
+      if(this.currentVersion(t).version!==version.version||(storedRound.checkpoint?.stepEpoch??0)!==(round.checkpoint?.stepEpoch??0))throw Error("实测校验期间标准版本或验收epoch已变化，旧结论作废");
       t.updatedAt = this.now().toISOString();
       if (allPass) {
         t.status = "delivered";
         t.pauseReason = null;
       } else {
         t.status = "rework";
+        if(version.executionPlanVersion)for(const a of version.assignments??[]){
+          if(!verdicts.some(v=>v.outcome==="gap"&&a.criterionIds?.includes(v.criterionId)))continue;
+          (data.collections.batchProgress??={})[`${taskId}:v${version.version}:${a.relPath}`]={completed:[]};
+          this.wakeWaitsInTx(data,taskId,`executor-reply:${a.relPath}`,"module_rework",t.updatedAt);
+        }
       }
       // 验收结论到达即唤醒"等验收结果"的等待，避免 waitingOn 悬挂
       this.wakeWaitsInTx(data, taskId, "acceptance", "verdict", t.updatedAt);
       storedRound.state = "settled";
+      if(allPass)queueDeliveryEvidence(data,t,storedRound,verdicts,artifactHashes);
       data.appendEvent({
         eventId: newId("evt"),
         taskId,
@@ -1735,18 +2063,22 @@ export class TaskService {
           ? submitter
           : version.executors[0]!.relPath;
       for (const gap of gaps) {
+        const contributors=version.executionPlanVersion?version.assignments?.filter(a=>a.criterionIds?.includes(gap.criterionId)).map(a=>a.relPath):undefined;
+        for (const gapOwner of contributors?.length ? contributors : [owner]) {
         const fresh = this.getTask(taskId)!;
         await this.gatedDeliver(
           { ...fresh, status: "rework" },
-          this.findExpert(fresh, owner),
-          `gap:${roundId}:${gap.criterionId}`,
+          this.findExpert(fresh, gapOwner??owner),
+          `gap:${roundId}:${gap.criterionId}${contributors && contributors.length>1?`:${gapOwner}`:""}`,
           [
             `验收退回（轮次 ${roundId}），缺项 [${gap.criterionId}]：${gap.gap ?? "未说明"}。证据：${gap.evidence ?? "未提供"}`,
             "修改前先用read读取当前文件，取得最新内容和版本；不要依赖上轮缓存直接edit，文件可能已被外部修改。",
             "只修复缺项；写入成功并依据工具结果核对后，直接提交longtask_report，后续独立核对交给验收者。",
+            ...(version.executionPlanVersion?[this.batchInstruction(taskId,gapOwner??owner)]:[]),
           ].join("\n"),
           "退回续做",
         );
+        }
       }
     }
     await this.o.onSubstantiveProgress?.(taskId, `验收结论 ${outcome}`);
@@ -1822,6 +2154,20 @@ export class TaskService {
       if (!claim.ok) { await this.queueTask(taskId, claim.reason); return; }
       await this.o.store.transact((data) => {
         this.wakeWaitsInTx(data, taskId, "user_reply", "resume", this.now().toISOString());
+        const prefix = `${taskId}:v${this.currentVersion(this.getTask(taskId)!).version}:`;
+        const round = this.latestPendingRound(taskId);
+        if (round) {
+          const stored = data.collections[COLLECTION_ROUNDS]?.[round.roundId] as AcceptanceRound | undefined;
+          if (stored) stored.checkpoint = {lastSummary:"",checkedCriteria:[],updatedAt:this.now().toISOString(),...stored.checkpoint,
+            steps:0,stepEpoch:(stored.checkpoint?.stepEpoch ?? 0)+1};
+          // 新恢复窗口使用新验收会话，旧会话的迟到取消/结论不能驱动本代。
+          for (const session of Object.values(data.collections[COLLECTION_SESSIONS]?.[taskId] ?? {}) as TaskSessionRecord[]) {
+            if (session.role==="acceptor"&&!session.revokedAt) session.revokedAt=this.now().toISOString();
+          }
+        }
+        for (const collection of ["truncationCounts", "missingReportStates"]) {
+          for (const key of Object.keys(data.collections[collection] ?? {})) if (key.startsWith(prefix)) delete data.collections[collection]![key];
+        }
         data.appendEvent({ eventId: newId("evt"), taskId, taskVersion: this.currentVersion(this.getTask(taskId)!).version,
           source: "user", type: "task.resumed", payloadRef: null, payload: {}, causedBy: null,
           dedupeKey: `resume:${newId("action")}`, createdAt: this.now().toISOString() });
@@ -1911,12 +2257,21 @@ export class TaskService {
     const fresh = this.getTask(taskId)!;
     if (fresh.status === "awaiting_acceptance") {
       const round = this.latestPendingRound(taskId);
+      if(!round&&(fresh.resumeStatus==="awaiting_acceptance"||this.getBatchProgress(taskId).length&&this.getBatchProgress(taskId).every(p=>p.currentBatch===null))){
+        await this.runAcceptance(taskId,`${prefix}:modules-complete`);return 1;
+      }
       if (!round) { await this.pause(taskId, "missing_input", "恢复验收时未找到有效轮次，需要核对"); return 0; }
       await this.deliverAcceptanceRequest(taskId, round.roundId, `${prefix}:accept:${round.roundId}`); return 1;
     }
+    if(this.currentVersion(fresh).executionPlanVersion===2){
+      const validation=validateExecutionPlan(this.currentVersion(fresh));
+      if(!validation.valid){await this.pause(taskId,"missing_input",`恢复时业务分工或依赖无法调度：${validation.errors.join("；")}`);return 0;}
+    }
+    await this.recordDependencyWaits(taskId);
     const before = new Set(this.o.store.list<MessageRecord>(COLLECTION_MESSAGES).filter(m => m.taskId === taskId && m.delivery === "delivered").map(m => m.id));
+    const moduleNotified=await this.handoffCompletedModulesLocked(taskId);
     const flushed = await this.flushPendingExpertMessagesLocked(taskId);
-    const notified = new Set(answered.owners);
+    const notified = new Set([...answered.owners,...moduleNotified]);
     for (const m of this.o.store.list<MessageRecord>(COLLECTION_MESSAGES)) {
       if (m.taskId === taskId && m.kind === "expert_direct" && m.delivery === "delivered" && !before.has(m.id) && m.toRelPath) notified.add(m.toRelPath);
     }
@@ -2046,9 +2401,37 @@ export class TaskService {
     if (tools !== undefined && (!Array.isArray(tools) || tools.some(t => typeof t !== "string" || !/^[a-zA-Z0-9_:-]+$/.test(t)) || new Set(tools).size !== tools.length)) throw new Error("必需工具必须是不重复的有效工具名");
   }
 
-  getRequiredTools(taskId: string): string[] {
+  getRequiredTools(taskId: string, role: "executor" | "acceptor" = "executor"): string[] {
     const task = this.getTask(taskId);
-    return task ? [...this.currentVersion(task).requiredTools ?? []] : [];
+    if(!task)return [];
+    const v=this.currentVersion(task);
+    return [...new Set([...(role==="acceptor"?v.acceptorRequiredTools:v.requiredTools)??[],...(role==="acceptor"&&v.verificationPlan?.checks.length?[VERIFICATION_TOOL]:[])])];
+  }
+
+  /** 用户批准补齐实测计划：沿用产物/费用，只重开独立验收，不让已完成模块重新开发。 */
+  async configureVerification(taskId:string,plan:VerificationPlan,expectedVersion:number,revision:{criteria?:Criterion[];scope?:VerificationScope;reason?:string}={}):Promise<void>{
+    await this.withTaskLock(taskId,async()=>{
+      const original=this.getTask(taskId);if(!original)throw Error("任务不存在");
+      const preview=structuredClone(this.currentVersion(original));preview.verificationPlan=structuredClone(plan);
+      if(revision.criteria){
+        const ids=new Set<string>();for(const c of revision.criteria){if(ids.has(c.id)||!preview.criteria.some(p=>p.id===c.id))throw Error("补测修订须引用原标准且编号不重复；新增需求请使用reopen");ids.add(c.id);const at=preview.criteria.findIndex(p=>p.id===c.id);preview.criteria[at]={...preview.criteria[at]!,...structuredClone(c)};}
+      }
+      if(revision.scope)preview.verificationScope=structuredClone(revision.scope);
+      const errors=validateVerificationPlan(preview);if(errors.length)throw Error(errors.join("；"));
+      const issue=this.o.verificationIssue?.(preview);if(issue)throw Error(issue);
+      if(this.o.ledger.accountingIssue(taskId))throw Error("模型费用尚未核对，不能补测");
+      await this.o.store.transact(data=>{
+        const t=data.collections[COLLECTION_TASKS]?.[taskId] as Task;
+        if(!t||this.currentVersion(t).version!==expectedVersion||!(t.status==="delivered"||(t.status==="paused"&&t.pauseReason==="missing_input")))throw Error("补测审批期间任务状态或版本已变化");
+        const v={...structuredClone(preview),version:expectedVersion+1,confirmedAt:this.now().toISOString()};
+        t.versions.push(v);t.currentVersion=t.versions.length-1;t.status="paused";t.pauseReason="queued";t.resumeStatus="awaiting_acceptance";t.updatedAt=this.now().toISOString();
+        for(const r of Object.values(data.collections[COLLECTION_ROUNDS]??{}) as AcceptanceRound[])if(r.taskId===taskId&&r.state==="pending")r.state="voided";
+        data.appendEvent({eventId:newId("evt"),taskId,taskVersion:v.version,source:"user",type:"task.reopened",payload:{verificationOnly:true,fromVersion:expectedVersion,reason:revision.reason??"补齐实测计划",criteriaChanges:revision.criteria?.map(c=>({id:c.id,before:this.currentVersion(original).criteria.find(p=>p.id===c.id),after:v.criteria.find(p=>p.id===c.id)}))??[],scope:v.verificationScope??null},createdAt:t.updatedAt,dedupeKey:`verify-plan:${taskId}:v${v.version}`});
+      });
+      await this.stopTaskSessions(taskId);
+      const claim=await this.claimSlot(taskId);if(!claim.ok){await this.queueTask(taskId,claim.reason);return;}
+      await this.runAcceptance(taskId,`verify-plan:${taskId}:v${expectedVersion+1}`);
+    });
   }
 
   /** 只读、按任务裁剪的审计快照；消费者不必轮询正在原子写入的状态文件。 */
@@ -2108,7 +2491,7 @@ export class TaskService {
   }
 
   /** 纠错重开：新增/修订标准后回到 active，预算沿用（不追加、不清零已用额度） */
-  async reopenWithCriteria(taskId: string, input: { criteria: Criterion[]; reason: string; expectedVersion?: number }): Promise<TaskVersion> {
+  async reopenWithCriteria(taskId: string, input: { criteria: Criterion[]; reason: string; expectedVersion?: number; assignments?:ExecutorAssignment[]; workModules?:WorkModule[]; staffingRationale?:string;verificationPlan?:VerificationPlan;verificationScope?:VerificationScope }): Promise<TaskVersion> {
     let created: TaskVersion | undefined;
     await this.o.store.transact((data) => {
       const t = (data.collections[COLLECTION_TASKS] ??= {})[taskId] as Task | undefined;
@@ -2119,15 +2502,24 @@ export class TaskService {
       const merged = [...prev.criteria];
       for (const c of input.criteria) {
         const at = merged.findIndex((x) => x.id === c.id);
-        if (at >= 0) merged[at] = { ...merged[at]!, text: c.text };
+        if (at >= 0) merged[at] = { ...merged[at]!, ...c };
         else merged.push(c);
       }
       const version: TaskVersion = {
         ...prev,
         version: prev.version + 1,
         criteria: merged,
+        ...(input.verificationPlan?{verificationPlan:structuredClone(input.verificationPlan)}:{}),
+        ...(input.verificationScope?{verificationScope:structuredClone(input.verificationScope)}:{}),
+        ...(input.assignments?{assignments:structuredClone(input.assignments)}:{}),
+        ...(input.workModules?{workModules:structuredClone(input.workModules)}:{}),
+        ...(input.staffingRationale!==undefined?{staffingRationale:input.staffingRationale}:{}),
         confirmedAt: this.now().toISOString(),
       };
+      this.normalizeAssignmentPaths(version);this.validateAssignments(version);
+      const verificationErrors=validateVerificationPlan(version);if(verificationErrors.length)throw Error("新标准须补齐实测计划："+verificationErrors.join("；"));
+      const capabilityIssue=this.o.verificationIssue?.(version);if(capabilityIssue)throw Error(capabilityIssue);
+      if(version.executionPlanVersion){const validation=validateExecutionPlan(version);if(!validation.valid)throw Error("新标准须先明确模块归属："+validation.errors.join("；"));}
       t.versions.push(version);
       t.currentVersion = t.versions.length - 1;
       t.status = "paused";
@@ -2241,15 +2633,26 @@ export class TaskService {
       const conflict = this.conflictingTask(taskId);
       if (conflict) return { ok: false, reason: `同一产物正被任务 ${conflict} 修改` };
     }
-    if (task.status === "paused") {
-      await this.o.store.transact(data => {
-        const t = data.collections[COLLECTION_TASKS]![taskId] as Task;
-        if (t.status !== "paused" || t.pauseReason !== task.pauseReason) throw new Error("调度认领时状态已改变");
-        t.status = this.latestPendingRound(taskId) ? "awaiting_acceptance" : t.resumeStatus === "rework" ? "rework" : "active";
+    const expectedStatus = task.status, expectedPauseReason = task.pauseReason;
+    let claimed = false;
+    await this.o.store.transact(data => {
+      const t = data.collections[COLLECTION_TASKS]?.[taskId] as Task | undefined;
+      if (!t || t.status !== expectedStatus || t.pauseReason !== expectedPauseReason) return;
+      if (expectedStatus === "paused") {
+        t.status = this.latestPendingRound(taskId)||t.resumeStatus==="awaiting_acceptance" ? "awaiting_acceptance" : t.resumeStatus === "rework" ? "rework" : "active";
         t.pauseReason = null; t.updatedAt = this.now().toISOString();
-      });
-    }
-    return { ok: true };
+      }
+      // 名额认领成功才开启新观察窗口；暂停/排队时间不计入本次停滞。
+      const progress = data.collections.progress?.[taskId] as import("../types.js").TaskProgressState | undefined;
+      if (progress) {
+        progress.observationStartedAt = this.now().toISOString();
+        progress.corrections = 0;
+        progress.recentInstructionHashes = [];
+        progress.lastAttemptNote = null;
+      }
+      claimed = true;
+    });
+    return claimed ? { ok: true } : { ok: false, reason: "调度认领时状态已改变" };
   }
 
   /** 恢复/出队/重启统一的派工上下文：每位执行者都拿到与自己相关的交接证据，不固定第一位 */
@@ -2273,8 +2676,9 @@ export class TaskService {
         const payload = verdictEvent?.payload as { roundId?: string; verdicts?: Verdict[] } | undefined;
         const round = payload?.roundId ? this.o.store.get<AcceptanceRound>(COLLECTION_ROUNDS, payload.roundId) : undefined;
         const owner = round?.submittedBy && version.executors.some(e => e.relPath === round.submittedBy) ? round.submittedBy : version.executors[0]!.relPath;
-        if (owner === expert.relPath) for (const gap of payload?.verdicts ?? []) {
-          if (gap.outcome === "gap") context.push(`验收返工（轮次 ${payload!.roundId}）[${gap.criterionId}]：${gap.gap}；依据：${gap.evidence}`);
+        for (const gap of payload?.verdicts ?? []) {
+          const ownsGap=version.executionPlanVersion?version.assignments?.some(a=>a.relPath===expert.relPath&&a.criterionIds?.includes(gap.criterionId)):owner===expert.relPath;
+          if (gap.outcome === "gap" && ownsGap) context.push(`验收返工（轮次 ${payload!.roundId}）[${gap.criterionId}]：${gap.gap}；依据：${gap.evidence}`);
         }
       }
       for (const job of this.o.store.list<{ taskId: string; taskVersion: number; relPath: string; jobId: string; settled: boolean }>("backgroundJobs")) {
@@ -2283,7 +2687,8 @@ export class TaskService {
         }
       }
       const ok = await this.gatedDeliver(fresh, expert, `${dedupePrefix}:${taskId}:v${version.version}:${expert.relPath}`, [
-        `【${reason}】`, `当前标准版本 v${version.version}：`, ...version.criteria.map(c => `- [${c.id}] ${c.text}`), ...context,
+        `【${reason}】`, `当前标准版本 v${version.version}：`, ...version.criteria.filter(c=>!version.executionPlanVersion||version.assignments?.find(a=>a.relPath===expert.relPath)?.criterionIds?.includes(c.id)).map(c => `- [${c.id}] ${c.text}`), ...context,
+        ...(version.executionPlanVersion?[this.batchInstruction(taskId,expert.relPath)]:[]),
         "先核对磁盘产物与会话上文，不要重复已经完成的写入或外部动作；再按简报里的报告协议推进当前缺项。",
       ].join("\n"), reason);
       if (ok !== null) delivered++;
@@ -2637,11 +3042,12 @@ export class TaskService {
       let woke = 0;
       await this.o.store.transact(data => {
         const jobs = (data.collections["backgroundJobs"] ??= {});
-        const old = jobs[key] as { settled: boolean; taskVersion: number; relPath: string; notified?: boolean; sessionKey?: string } | undefined;
+        const old = jobs[key] as { settled: boolean; taskVersion: number; relPath: string; notified?: boolean; sessionKey?: string; registeredAt?: string } | undefined;
         if (settled && !old) return; // 未观测注册，不能用迟到/无关联的结束事件解除当前等待。
         if (old && (old.taskVersion !== version || old.relPath !== relPath)) return;
         if (settled) woke = this.wakeWaitsInTx(data, taskId, `job:${relPath}:${jobId}`, "job_settled", this.now().toISOString());
         jobs[key] = { taskId, relPath, jobId, taskVersion: version, settled: settled || old?.settled === true, notified: old?.notified || woke > 0,
+          registeredAt: old?.registeredAt ?? this.now().toISOString(),
           sessionKey: old?.sessionKey ?? sessionKey ?? this.getSessions(taskId).filter(s => s.role === "executor" && s.relPath === relPath).at(-1)?.sessionKey };
       });
       if (woke > 0 && ["active", "rework"].includes(this.getTask(taskId)!.status) && this.activeBackgroundJobs(taskId, relPath).length === 0) {
@@ -2682,7 +3088,17 @@ export class TaskService {
     content: string,
     options: { artifactRefs?: string[]; replyToId?: string | null; actionId?: string; sourceTurnId?: string } = {},
   ): Promise<{ ok: boolean; messageId?: string; reason?: string; delivery?: string; duplicate?: boolean }> {
-    return this.withTaskLock(taskId, async () => {
+    return this.withTaskLock(taskId,()=>this.sendExpertMessageLocked(taskId,fromRelPath,toRelPath,content,options));
+  }
+
+  private async sendExpertMessageLocked(
+    taskId: string,
+    fromRelPath: string,
+    toRelPath: string,
+    content: string,
+    options: { artifactRefs?: string[]; replyToId?: string | null; actionId?: string; sourceTurnId?: string } = {},
+  ): Promise<{ ok: boolean; messageId?: string; reason?: string; delivery?: string; duplicate?: boolean }> {
+
       const task = this.getTask(taskId);
       if (!task) throw new Error(`任务不存在: ${taskId}`);
       if (task.status !== "active" && task.status !== "rework") {
@@ -2768,7 +3184,6 @@ export class TaskService {
       const result = await this.deliverExpertMessage(fresh, record);
       if (result.delivery === "delivered" && version.assignments) await this.flushPendingExpertMessagesLocked(taskId);
       return result;
-    });
   }
 
   /** 把一条已落库的定向消息投递给收件人（投递失败保留记录，可用同一 actionId 重试） */
@@ -2785,6 +3200,12 @@ export class TaskService {
     if (!to) {
       await this.markMessageDelivery(record.id, "failed");
       return { ok: false, messageId: record.id, reason: "recipient-not-executor" };
+    }
+    if (this.executorModuleComplete(task.id, to.relPath)) {
+      // 已完成模块保留留言记录，不再为普通交接创建/唤醒执行会话。
+      // 后续确需返工时由独立验收重新打开对应模块。
+      await this.markMessageDelivery(record.id, "failed");
+      return {ok: false, messageId: record.id, reason: "recipient-module-complete", delivery: "failed"};
     }
     if (this.getExecutorDependency(task.id, to.relPath).state === "waiting" && !this.matchesDependency(task, to.relPath, record)) {
       await this.markMessageDelivery(record.id, "pending");
@@ -2975,7 +3396,14 @@ export class TaskService {
           if (change.remove) v.assignments = v.assignments.map((a) => ({ ...a, relPath: a.relPath === change.remove ? change.add.relPath : a.relPath,
             ...(a.waitFor ? { waitFor: { ...a.waitFor, fromRelPath: a.waitFor.fromRelPath === change.remove ? change.add.relPath : a.waitFor.fromRelPath } } : {}) }));
           else v.assignments.push({ relPath: change.add.relPath, deliverables: [] });
+          if (change.remove && v.workModules) v.workModules=v.workModules.map(m=>({...m,
+            leadRelPath:m.leadRelPath===change.remove?change.add.relPath:m.leadRelPath,
+            ...(m.contributors?{contributors:m.contributors.map(p=>p===change.remove?change.add.relPath:p)}:{})}));
           this.validateAssignments(v);
+          if(v.executionPlanVersion){
+            const validation=validateExecutionPlan(v);if(!validation.valid)throw Error("换人后的模块分工不完整："+validation.errors.join("；"));
+            if(change.remove){const table=(data.collections.batchProgress??={}),oldKey=`${taskId}:v${v.version}:${change.remove}`,newKey=`${taskId}:v${v.version}:${change.add.relPath}`;if(table[oldKey])table[newKey]=structuredClone(table[oldKey]);}
+          }
         }
         if (change.remove) {
           for (const previous of this.currentArtifacts(taskId).filter((a) => a.ownerRelPath === change.remove)) {
@@ -3234,7 +3662,10 @@ export class TaskService {
     if (!task || (task.status !== "active" && task.status !== "rework")) return false;
     const version = this.currentVersion(task);
     const approvalOwners = new Set(this.listWaits(taskId).filter(w => w.status === "waiting" && w.taskVersion === version.version && w.kind === "user_approval" && w.observed).map(w => w.executorRelPath));
-    const owner = version.executors.find(e => !approvalOwners.has(e.relPath))?.relPath;
+    const liveJobs = this.o.store.list<ObservedJob>("backgroundJobs").filter(j=>j.taskId===taskId&&j.taskVersion===version.version&&
+      jobWithinGrace(j,this.now().getTime(),this.o.backgroundJobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS,task.createdAt));
+    const owner = version.executors.find(e => !approvalOwners.has(e.relPath)&&!this.executorModuleComplete(taskId,e.relPath)&&
+      this.getExecutorDependency(taskId,e.relPath).state!=="waiting"&&!liveJobs.some(j=>j.relPath===e.relPath))?.relPath;
     if (!owner) return false;
     const dedupeKey = `watchdog:${taskId}:${instructionKey(instruction)}:${this.now().toISOString()}`;
     const delivered = await this.gatedDeliver(
@@ -3301,22 +3732,24 @@ export class TaskService {
    * 背景：每读一个文件，工具结果就永久留在上下文里，后续每一步都要为它付费。
    * 实测同一任务两轮：读得少的那轮上下文 +9k、27 万交付；读得多的那轮 +30k、60 万都没交付。
    */
-  async requestReadStop(taskId: string, readCalls: number): Promise<boolean> {
+  async requestReadStop(taskId: string, readCalls: number, executorRelPath?: string): Promise<boolean> {
+    const task = this.getTask(taskId);
+    if (!task) return false;
     return this.sendConvergence(
       taskId,
       "read-stop",
       "task.read_stop_requested",
       [
-        `【读预算用尽】本任务已发生 ${readCalls} 次读文件/检索类调用，超过上限。`,
+        `【读取提醒】本执行会话已发生 ${readCalls} 次读文件/检索类调用，达到配置提醒阈值。`,
         "",
-        "从下一条消息起：",
-        "1. 不要再 read/grep/glob/列目录，也不要为核对细节去翻源码；",
-        "2. 按任务简报里已有的信息，把交付物就地补完（已有文件只改必要段落）；",
-        "3. 立刻在回复末尾给出 `<longtask_report>`。",
+        "请检查是否重复读取，优先精确检索和复用已有结果。",
+        "当前批次必需的源码阅读、资料核对和测试验证仍可继续；不要为了减少次数而跳过验证。",
+        "按真实进展给出 `<longtask_report>`，不必为本提醒提前声明完成。",
         "",
-        "说明：每一次读取都会永久留在上下文里，让后面每一步都更贵。继续读下去，预算会在验收前耗尽。",
+        "本提醒只发给当前执行者；后续请求仍按实际上下文与原预算准入。",
       ].join("\n"),
       "读预算指令",
+      executorRelPath ?? this.currentVersion(task).executors[0]?.relPath,
     );
   }
 
@@ -3327,16 +3760,18 @@ export class TaskService {
     eventType: EventType,
     content: string,
     purpose: string,
+    targetRelPath?: string,
   ): Promise<boolean> {
     const task = this.getTask(taskId);
     if (!task || (task.status !== "active" && task.status !== "rework")) return false;
     const version = this.currentVersion(task);
-    const dedupeKey = `${kind}:${taskId}:v${version.version}`;
+    const dedupeKey = `${kind}:${taskId}:v${version.version}${targetRelPath ? `:${targetRelPath}` : ""}`;
     // 先做进程内占位：持久化去重是"先查后写"，同一批事件（实测 6ms 内两次 tool/call）
     // 会同时通过检查，导致同一条指令投递两遍。
     if (!this.claimOnce(dedupeKey)) return false;
     if (this.o.store.findByDedupe(dedupeKey) || this.messageDelivered(dedupeKey)) return false;
-    const owners = version.executors.map(e => e.relPath);
+    const owners = version.executors.filter(e=>!targetRelPath||e.relPath===targetRelPath).map(e => e.relPath);
+    if (!owners.length) return false;
     const owner = owners[0]!;
     await this.o.store.transact((data) => {
       const t = (data.collections[COLLECTION_TASKS] ??= {})[taskId] as Task | undefined;

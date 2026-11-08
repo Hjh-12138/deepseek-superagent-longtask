@@ -6,9 +6,10 @@ import {formatCny} from "./ledger/money.js";
 import {pendingApprovals, type TaskApproval} from "./approval-waits.js";
 
 declare module "@deepseek-ai/dsh-llm" {
-  interface MessageSourceMap {"longtask-status": {kind: "longtask-status"; form: "notice"; summary: string; taskId: string; eventId: string}}
+  interface MessageSourceMap {"longtask-status": {kind: "longtask-status"; form: "notice"; summary: string; taskId: string; eventId: string;
+    workers?: Array<{sessionId: string; relPath: string; toolName: string; requestId: string}>}}
 }
-export const ROUTER_NOTICE_PROTOCOL = 2;
+export const ROUTER_NOTICE_PROTOCOL = 3;
 interface Notice {
   id: string; taskId: string; targetSessionId: string; eventId: string;
   taskStatus: string; pauseReason: string | null; message: UserMessage;
@@ -68,7 +69,8 @@ export class RouterNotices {
         notices[id] = {id, taskId, eventId: event.eventId, targetSessionId: task.routerSessionId!, taskStatus: task.status, pauseReason: task.pauseReason,
           topic: topic(event), ...(topic(event) === "approval" ? {approvalKeys: pendingApprovals(data, taskId).map(a => a.key).sort()} : {}),
           message: createUserMessage({content: [{type: "text", text: text ?? "此状态已过期或无需通知"}],
-            source: {kind: "longtask-status", form: "notice", summary: boundContextSummary(`${text?.split("\n")[0] ?? "长任务状态"} ${taskId} ${text?.split("\n")[3] ?? ""}`), taskId, eventId: event.eventId}}), delivery: text ? "pending" : "superseded"} satisfies Notice;
+            source: {kind: "longtask-status", form: "notice", summary: boundContextSummary(`${text?.split("\n")[0] ?? "长任务状态"} ${taskId} ${text?.split("\n").find(line => line.startsWith("原因：")) ?? ""}`), taskId, eventId: event.eventId,
+              ...(topic(event) === "approval" ? {workers: pendingApprovals(data, taskId).map(a => ({sessionId: a.sessionId, relPath: a.relPath, toolName: a.toolName, requestId: a.requestId}))} : {})}}), delivery: text ? "pending" : "superseded"} satisfies Notice;
       });
     }
     for (const n of this.store.list<Notice>("routerNotices")) {

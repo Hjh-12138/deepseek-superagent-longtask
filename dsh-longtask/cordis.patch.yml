@@ -13,9 +13,19 @@
         # Worker/验收会话：不指定模型时宿主不会启动轮次（真机实测）
         workerProvider: "deepseek-official"
         workerModel: "deepseek-flash"
-        workerMaxTokens: 8000
+        workerMaxTokens: "host"
+        # 多批次Worker默认按预算与进展继续；0不设累计模型步数硬上限。
+        executorMaxSteps: 0
+        acceptorMaxSteps: 0
+        acceptorProgressWindowSteps: 8
+        acceptorMaxIdleSteps: 3
+        acceptorToolWaitMs: 15000
+        toolReadBudget: 0
+        acceptanceReadBudgetBytes: 65536
+        backgroundJobTimeoutMs: 7200000
         # auto = Worker 会话挂到首个用户会话下，尝试继承发起方凭证上下文
         workerParentAgent: "auto"
         # 能力集：standard 含文件写入/命令执行工具；留空则只有全局工具
         workerPreset: "standard"
         acceptorReadOnly: true
+        acceptorReadTools: []

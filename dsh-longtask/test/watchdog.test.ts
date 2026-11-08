@@ -184,3 +184,18 @@ test("重启恢复：active 任务会话存活则续；暂停与预算不足不�
   assert.equal(after.reservedTokens, 0, "在途占额归零");
   assert.ok(after.settledTokens >= 100, "按估算保守记账（宁可高估消耗）");
 });
+
+test("宿主已登记运行命令在turn结束前也有有限等待窗口，重放注册不延长",async()=>{
+  const f=await makeWorld();try{
+    const task=await f.svc.propose({goal:"g",criteria:[{id:"c",text:"c"}],deliverables:["d"],executors:[expert("a")],acceptor:expert("r"),budget:{limitTokens:2000000,strict:true}});
+    await f.svc.confirm(task.id);await f.svc.observeBackgroundJob(task.id,"a","compile",false);
+    const registered=f.store.list<{registeredAt:string}>("backgroundJobs")[0]!.registeredAt;
+    await f.svc.observeBackgroundJob(task.id,"a","compile",false);
+    assert.equal(f.store.list<{registeredAt:string}>("backgroundJobs")[0]!.registeredAt,registered);
+    const now=Date.now();
+    const wd=new Watchdog(f.store,{stallThresholdMs:1000,maxCorrections:2,jobTimeoutMs:7200000},()=>now+3600000);
+    assert.deepEqual(wd.checkAll(),[],"不需要等turn/end建立taskWaits才识别真实命令");
+    const expired=new Watchdog(f.store,{stallThresholdMs:1000,maxCorrections:2,jobTimeoutMs:7200000},()=>now+10800000);
+    assert.equal(expired.checkAll()[0]!.action.action,"correct","真正超时仍可纠偏");
+  }finally{await f.store.close();}
+});

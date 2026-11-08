@@ -7,7 +7,7 @@
  * 本模块把"一次模型请求至少要占用多少额度"收敛为一个纯函数，供三处共用：
  * - 派工闸门（TaskService.gateDispatch）：没额度就不建会话、不投递
  * - 恢复（TaskService.resume）：额度不足以支撑一步就不解锁
- * - 请求前准入（agent/pre-step）：真正预留的地方，与在途准入合并判断
+ * - 显式限额在agent/pre-step预留；宿主模式在最终llm/stream边界按解析后的上限预留
  *
  * 公式：cost = ceil(baseline 或 已观测输入 × 安全系数) + 输出上限
  * 已观测输入来自上一轮 assistant/message 的真实 usage，能自动跟随上下文增长。
@@ -18,14 +18,14 @@ export interface AdmissionPolicy {
   baselineInputTokens: number;
   /** 对已观测输入的上浮系数：吸收下一轮新增的工具结果与历史增长 */
   inputSafetyFactor: number;
-  /** 单次请求的输出上限（与 workerMaxTokens 对齐） */
+  /** 显式上限；0仅表示宿主模式下尚未解析的前置规划，最终流边界必须取得正整数。 */
   maxOutputTokens: number;
 }
 
 export const DEFAULT_ADMISSION: AdmissionPolicy = {
   baselineInputTokens: 12_000,
   inputSafetyFactor: 1.25,
-  maxOutputTokens: 8000,
+  maxOutputTokens: 16000,
 };
 
 /** 归一化策略：拒绝非有限值，避免 NaN 一路传播成"永远够用"或"永远不够" */
@@ -37,7 +37,7 @@ export function normalizeAdmission(partial?: Partial<AdmissionPolicy>): Admissio
     // 此时严格模式在首轮（没有实测链条）会拒绝调用而不是猜一个数（P1-1）。
     baselineInputTokens: pick(partial?.baselineInputTokens, DEFAULT_ADMISSION.baselineInputTokens, 0),
     inputSafetyFactor: pick(partial?.inputSafetyFactor, DEFAULT_ADMISSION.inputSafetyFactor, 1),
-    maxOutputTokens: pick(partial?.maxOutputTokens, DEFAULT_ADMISSION.maxOutputTokens, 1),
+    maxOutputTokens: pick(partial?.maxOutputTokens, DEFAULT_ADMISSION.maxOutputTokens, 0),
   };
 }
 
@@ -59,7 +59,7 @@ export function requestAdmissionCost(policy: AdmissionPolicy, observedInputToken
 export function describeAdmission(policy: AdmissionPolicy, observedInputTokens?: number): string {
   const input = estimateRequestInput(policy, observedInputTokens);
   const source = typeof observedInputTokens === "number" && observedInputTokens > 0 ? `实测输入 ${observedInputTokens}` : `基线输入 ${policy.baselineInputTokens}`;
-  return `${source} × ${policy.inputSafetyFactor} = ${input} + 输出上限 ${policy.maxOutputTokens} = ${input + policy.maxOutputTokens}`;
+  return policy.maxOutputTokens===0?`${source} × ${policy.inputSafetyFactor} = ${input}，输出上限待DSH解析，最终请求前另行足额预留`:`${source} × ${policy.inputSafetyFactor} = ${input} + 输出上限 ${policy.maxOutputTokens} = ${input + policy.maxOutputTokens}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,13 +140,21 @@ export function requestCostFor(bound: InputBound, policy: AdmissionPolicy): numb
 
 /** 两步验收计划：读取产物，再给结论。使用与正式请求相同的输入基线和输出上限。 */
 export function planAcceptance(policy: AdmissionPolicy, input: {
-  requestBytes: number; artifactBytes: number; unknownArtifacts: number; artifactCount: number; minimumTokens: number;
+  requestBytes: number; artifactBytes: number; unknownArtifacts: number; artifactCount: number; minimumTokens: number; readBudgetBytes?: number;
 }) {
   const firstInput = boundRequestInput(policy, { inboundChars: input.requestBytes }).tokens;
-  // JSON 文本转义最坏可把一个字节扩成6字节；另留工具信封开销。
-  // 尚未落盘的文件只能作规划，不能声称知道其最终大小；每个未知文件暂留一个输出上限。
-  const readGrowth = input.artifactBytes * 6 + input.artifactCount * 1024 + input.unknownArtifacts * policy.maxOutputTokens;
+  // 未来验收按有限读取计划预留，不假定所有产物全文进入上下文。
+  // 这是可调整的收尾规划；每次实际请求仍按最终完整输入与宿主输出上限硬准入。
+  const readBudgetBytes = input.readBudgetBytes ?? 65_536;
+  if (!Number.isSafeInteger(readBudgetBytes) || readBudgetBytes < 0) throw Error("验收读取规划必须为非负安全整数");
+  const unknownReadBytes = policy.maxOutputTokens > 0 ? Math.min(4096,Math.floor(policy.maxOutputTokens/6)) : 1024;
+  const plannedReadBytes = Math.min(readBudgetBytes, input.artifactBytes + input.unknownArtifacts * unknownReadBytes);
+  const readGrowth = plannedReadBytes * 6 + Math.min(input.artifactCount, 16) * 1024;
   const firstRequest = firstInput + policy.maxOutputTokens;
   const conclusionRequest = firstInput + policy.maxOutputTokens + readGrowth + policy.maxOutputTokens;
-  return { firstRequest, conclusionRequest, readGrowth, tokens: Math.max(input.minimumTokens, firstRequest + conclusionRequest), unknownArtifacts: input.unknownArtifacts };
+  const inputTokens = firstInput * 2 + policy.maxOutputTokens + readGrowth;
+  const outputTokens = policy.maxOutputTokens * 2;
+  const untypedTokens = Math.max(0,input.minimumTokens-inputTokens-outputTokens);
+  return { firstRequest, conclusionRequest, readGrowth, inputTokens, outputTokens, untypedTokens,
+    plannedReadBytes, readBudgetBytes, tokens: inputTokens+outputTokens+untypedTokens, unknownArtifacts: input.unknownArtifacts };
 }

@@ -15,7 +15,7 @@
 import type { Store } from "../store/store.js";
 import { newId } from "../store/store.js";
 import type { LedgerEntry, Reservation, TaskBudgetState, UsageSample } from "../types.js";
-import {PriceTable, formatCny, priceUsage, priceBound, priceTokenCeiling, type MoneyReservation} from "./money.js";
+import {PriceTable, formatCny, priceUsage, priceBound, priceProjection, type TokenProjection, type MoneyReservation} from "./money.js";
 
 export const COLLECTION_BUDGET = "budgets";
 export const COLLECTION_ENTRIES = "ledger";
@@ -35,7 +35,7 @@ export function normalizeUsage(raw: UsageSample): { inputTokens: number; outputT
 
 export class TokenLedger {
   readonly moneyAccountingProtocol = 1;
-  readonly protectedReserveVersion = 1;
+  readonly protectedReserveVersion = 2;
   readonly requestAccountingProtocol = 1;
   constructor(
     private readonly store: Store,
@@ -56,16 +56,16 @@ export class TokenLedger {
       provider: e.money!.price.provider, model: e.money!.price.model, priceSnapshot: e.money!.price, calculatedAmount: formatCny(e.money!.chargedNano), basis: e.money!.basis,
     }));
   }
-  moneyForecast(taskId: string, input: number, output: number, protectedTokens = 0, closingTokens = 0) {
+  moneyForecast(taskId: string, input: number, output: number, protectedTokens: TokenProjection = 0, closingTokens: TokenProjection = 0) {
     const m = this.getBudget(taskId)?.money;
     if (!m) return null;
     const p = this.prices.get(this.route.provider, this.route.model, this.now());
     return {available: BigInt(m.limitNano) - BigInt(m.settledNano) - BigInt(m.reservedNano),
-      need: priceBound(p, input, output), protected: priceTokenCeiling(p, protectedTokens), closing: priceTokenCeiling(p, closingTokens),
+      need: priceBound(p, input, output), protected: priceProjection(p, protectedTokens), closing: priceProjection(p, closingTokens),
       usedRatio: Number(BigInt(m.settledNano) + BigInt(m.reservedNano)) / Number(m.limitNano)};
   }
   /** Bind the ACTUAL request route before the request leaves the host. Same transaction reserves money. */
-  async reserveMoney(reservationId: string, route: {provider: string; model: string}, input: number, output: number, protectedTokens: number,
+  async reserveMoney(reservationId: string, route: {provider: string; model: string}, input: number, output: number, protectedTokens: TokenProjection,
     identity: Omit<MoneyReservation, "price" | "reservedNano">): Promise<void> {
     await this.store.transact(data => {
       const r = data.collections.reservations?.[reservationId] as Reservation | undefined;
@@ -80,7 +80,7 @@ export class TokenLedger {
       if (data.collections.accountingIssues?.[r.taskId]) throw Error("费用待核对，拒绝请求");
       const price = this.prices.get(route.provider, route.model, this.now()), need = priceBound(price, input, output);
       const available = BigInt(m.limitNano) - BigInt(m.settledNano) - BigInt(m.reservedNano);
-      if (available < need + priceTokenCeiling(price, protectedTokens)) throw Error(`金额不足：本次预留¥${formatCny(need)}，另留收尾验收费用，可用¥${formatCny(available)}`);
+      if (available < need + priceProjection(price, protectedTokens)) throw Error(`金额不足：本次预留¥${formatCny(need)}，另留收尾验收费用，可用¥${formatCny(available)}`);
       m.reservedNano = (BigInt(m.reservedNano) + need).toString();
       r.money = {...identity, price, reservedNano: need.toString()};
     });

@@ -13,6 +13,7 @@ import type { Store } from "../store/store.js";
 import type { Task, TaskProgressState } from "../types.js";
 import { COLLECTION_TASKS } from "../tasks/task-service.js";
 import type { TokenLedger } from "../ledger/token-ledger.js";
+import {DEFAULT_JOB_TIMEOUT_MS,jobWithinGrace,type ObservedJob} from "../tasks/job-state.js";
 
 export const COLLECTION_PROGRESS = "progress";
 
@@ -21,6 +22,7 @@ export interface WatchdogConfig {
   stallThresholdMs: number;
   /** 连续纠偏次数达到该值才求助用户 */
   maxCorrections: number;
+  jobTimeoutMs?: number;
 }
 
 export const DEFAULT_WATCHDOG_CONFIG: WatchdogConfig = {
@@ -72,7 +74,8 @@ export function watchdogDecision(
   const prev = hashes[hashes.length - 2];
   const repeated = last !== undefined && prev === last;
 
-  const elapsed = now - Date.parse(progress.lastSubstantiveAt);
+  const elapsed = now - Math.max(Date.parse(progress.lastSubstantiveAt),
+    Date.parse(progress.observationStartedAt ?? progress.lastSubstantiveAt));
   if (repeated && elapsed > cfg.stallThresholdMs) {
     if (progress.corrections < cfg.maxCorrections) {
       return {
@@ -194,12 +197,19 @@ export class Watchdog {
       if (task.status !== "active" && task.status !== "rework") continue;
       const active = waits.filter((w) => w.taskId === task.id && w.status === "waiting" &&
         (w.taskVersion ?? 1) === task.versions[task.currentVersion]?.version);
+      const version = task.versions[task.currentVersion]!;
+      const liveJobs = this.store.list<ObservedJob>("backgroundJobs").filter(j=>j.taskId===task.id&&j.taskVersion===version.version&&
+        jobWithinGrace(j,this.now(),this.cfg.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS,task.createdAt));
       // 只有"全部执行者都有可靠外部等待"才整体免催：一位下游等待不能屏蔽上游停滞（审查 C8）
-      const executors = (task.versions[task.currentVersion]?.executors ?? []).map((e) => e.relPath);
+      const executors = version.executors.filter(e=>{
+        const a=version.executionPlanVersion&&version.assignments?.find(a=>a.relPath===e.relPath);
+        const completed=this.store.get<{completed:string[]}>("batchProgress",`${task.id}:v${version.version}:${e.relPath}`)?.completed ?? [];
+        return !a || !a.batches?.every(b=>completed.includes(b.id));
+      }).map(e=>e.relPath);
       const waitingExecutors = new Set(
-        [...active.filter(w => w.kind === "user_approval" && w.observed && w.executorRelPath).map(w => w.executorRelPath!), ...active
+        [...liveJobs.map(j=>j.relPath),...active.filter(w => w.kind === "user_approval" && w.observed && w.executorRelPath).map(w => w.executorRelPath!), ...active
           .map((w) => w.wakeCondition)
-          .filter((c): c is string => /^(dependency|executor-reply|job):/.test(c ?? ""))
+          .filter((c): c is string => /^(dependency|executor-reply):/.test(c ?? "") || Boolean(c?.startsWith("job:")&&liveJobs.some(j=>c===`job:${j.relPath}:${j.jobId}`)))
           .map((c) => c.split(":")[1] ?? "")],
       );
       const allBlocked = executors.length > 0 && executors.every((rel) => waitingExecutors.has(rel));

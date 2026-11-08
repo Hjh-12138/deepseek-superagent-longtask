@@ -69,8 +69,13 @@ export function searchExperts(experts:readonly ExpertRef[], query:string): Exper
   }).filter(m=>!q||m.score>0).sort((a,b)=>b.score-a.score||a.expert.relPath.localeCompare(b.expert.relPath));
 }
 function taskDuties(task:string): {domain:"software"|"general";duties:Duty[]} {
+  // 调用方以首行目标、后续标准传入。技术术语属于文档内容时，不把写作任务变成软件开发。
+  const purpose=normalize(task.split(/\r?\n/,1)[0]??task);
+  const documentGoal=/^(?:(?:请|帮我|仅|只|需|需要|完成|为[^，。；]{0,16})\s*)*(?:写(?!入)|编写|撰写|补充|整理|生成|输出|交付|write|draft)\s*[^，。；\n]*?(?:文档|README|手册|报告|教程|指南|说明书|documentation|manual|guide|report)/i;
+  const implementsCode=/(?:并|同时|另外|还需|还要|然后|以及|且|[，。；])\s*(?:实际)?(?:开发|实现|编程|修复|重构|调试|部署|构建)|^(?:请)?\s*(?:写|编写|生成|输出)\s*[^，。；]{0,24}(?:代码|程序|测试脚本|自动化脚本)(?:和|及|并|与)/.test(purpose);
+  if(documentGoal.test(purpose)&&!implementsCode)return {domain:"general",duties:[]};
   const text=normalize(task).replace(/(?:不需要|无需|不做|不用|不涉及|不包含|排除)[^，。；;.!?\n]*/g," "),detected=hits(text);
-  const researchOnly=/调研|研究|对比|比较|报告|文稿|文案|文档|说明书/.test(text)
+  const researchOnly=!implementsCode&&/调研|研究|对比|比较|报告|文稿|文案|文档|说明书/.test(text)
     && !/开发|实现|编程|修复|重构|调试|测试|部署|构建|优化/.test(text)
     && !["build","implement","fix","debug","refactor","test","deploy"].some(a=>contains(text,a));
   if(researchOnly)return {domain:"general",duties:[]};

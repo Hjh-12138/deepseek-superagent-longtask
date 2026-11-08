@@ -27,7 +27,7 @@ for (const unknownUsage of [false,true]) test(unknownUsage ? "原版SDK loop+ret
       yield {type:'finish',reason:calls===1?{kind:'error',failure:{code:'TRANSPORT',message:'offline deterministic failure'}}:{kind:'stop'}};
     }}}});
   const loop=new AgentLoop(root,{agents:[],maxParallelToolCalls:1});if(typeof loop[Service.init]==="function")await loop[Service.init]();retry.apply(root,{});
-  apply(root,{dataDir:dir,agencyAgentsRoot:join(dir,'experts'),workerCwd:dir,workerPreset:'',workerParentAgent:'none',workerProvider:'offline',workerModel:'offline',probeOnStart:false,watchdogIntervalMs:3600000,acceptanceReserveTokens:0,wrapUpAtBudgetRatio:0,wrapUpMinStepsLeft:0});
+  apply(root,{workerMaxTokens:16000,dataDir:dir,agencyAgentsRoot:join(dir,'experts'),workerCwd:dir,workerPreset:'',workerParentAgent:'none',workerProvider:'offline',workerModel:'offline',probeOnStart:false,watchdogIntervalMs:3600000,acceptanceReserveTokens:0,wrapUpAtBudgetRatio:0,wrapUpMinStepsLeft:0});
   try{
     for(let i=0;i<500&&!root.get('longtask')?.getRuntimeInfo().ready;i++)await delay(10);const api=root.get('longtask');assert.ok(api?.getRuntimeInfo().ready);
     const e=(relPath:string)=>({relPath,division:'research',name:relPath,intro:'test',contentHash:'fixture',snapshottedAt:new Date().toISOString()});
@@ -43,6 +43,6 @@ for (const unknownUsage of [false,true]) test(unknownUsage ? "原版SDK loop+ret
     assert.equal(events.filter(e=>e.type==='assistant/attempt').length,1);assert.equal(events.filter(e=>e.type==='assistant/message').length,1);
     assert.equal(api.getBudget(task.id).settledTokens,24);assert.equal(api.getBudget(task.id).reservedTokens,0);
     const ledger=Object.values(api.getTaskEvidence(task.id).collections.ledger) as any[];assert.equal(ledger.length,2);assert.notEqual(ledger[0].attemptId,ledger[1].attemptId);
-    assert.ok(requests.every(r=>r.maxTokens<=8000));
+    assert.ok(requests.every(r=>r.maxTokens<=16000));
   }finally{await root.fiber.dispose()}
 });

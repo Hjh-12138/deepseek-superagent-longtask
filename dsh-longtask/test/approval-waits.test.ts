@@ -49,6 +49,17 @@ test("审批即时回传真实Router会话：多个Worker同编号独立跟踪�
   }finally{await f.close();}
 });
 
+test("审批通知提供结构化Worker入口，多行目标不挤掉摘要中的待审批原因",async()=>{
+  const f=await fixture();try{
+    await f.store.transact(data=>{(data.collections.tasks![f.taskId] as Task).versions[0]!.goal='开发系统\n技术栈：不能挤占审批原因'});
+    await f.ask(f.a,'native-request','安装原生依赖需要用户决定');await f.settle();
+    const message=f.router.snapshotEvents().findLast(e=>e.type==='user/message')!.data as any;
+    assert.deepEqual(message.source.workers,[{sessionId:f.a.sessionId,relPath:f.a.relPath,toolName:'pwsh',requestId:'native-request'}]);
+    assert.match(message.source.summary,/等待用户审批/);assert.doesNotMatch(message.source.summary,/技术栈/);
+    assert.equal(message.source.kind,'longtask-status');assert.equal(f.wakes,0);
+  }finally{await f.close()}
+});
+
 test("审批事件重放、决定先到及无关会话：不复活等待、不重复通知",async()=>{
   const f=await fixture();try{
     await f.ask(f.a);await f.settle();const count=f.texts().length;

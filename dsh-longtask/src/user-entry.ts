@@ -1,21 +1,30 @@
 import {createHash} from "node:crypto";
-import {isAbsolute} from "node:path";
+import {isAbsolute,relative,resolve,sep} from "node:path";
 import {statSync} from "node:fs";
 import {pendingApprovals} from "./approval-waits.js";
 import {searchExperts, recommendExperts, reviewStaffing} from "./catalog/recommend.js";
+import {validateExecutionPlan} from "./execution-plan.js";
 import type {HostContext} from "./host-types.js";
 import type {TaskService, ProposeInput} from "./tasks/task-service.js";
 import type {TokenLedger} from "./ledger/token-ledger.js";
-import type {ExpertRef, Task, ExecutorAssignment} from "./types.js";
+import type {ExpertRef, Task, ExecutorAssignment, WorkModule} from "./types.js";
 import {parseCny, formatCny} from "./ledger/money.js";
+import {verificationReview,validateVerificationPlan,missingVerification,VERIFICATION_RUNS,type VerificationRun} from "./verification.js";
+import type {VerificationPlan} from "./types.js";
+import type {VerificationScope,TaskWorkKind} from "./types.js";
+import {taskWorkKind} from "./work-kind.js";
+import {DELIVERY_EVIDENCE,type DeliveryEvidence} from "./delivery-evidence.js";
 
 export const USER_TASK_TOOLS = ["longtask_experts", "longtask_propose", "longtask_confirm", "longtask_control", "longtask_tasks"] as const;
-export const USER_TASK_ENTRY_PROTOCOL = 3;
+export const USER_TASK_ENTRY_PROTOCOL = 7;
 export interface EntryAgent { id?: string; session?: {id?: string; header?: {parentSession?: string}} }
 interface Execution {agent?: EntryAgent; callId: string; signal: AbortSignal}
 interface Definition {name: string; description: string; parameters: Record<string, unknown>; output: {schema: {type: "string"}; render(args: unknown, value: string): Array<{type: "text"; text: string}>}; execute(args: unknown, exec: Execution): Promise<string>}
 interface Tools {register(def: Definition): () => void}
-interface Approval {request(input: {agent: EntryAgent; toolName: string; callId: string; reason: string; signal: AbortSignal}): Promise<"allowed-once" | "rejected" | "cancelled" | "unavailable">}
+interface Approval {
+  effectivePolicy?(session: NonNullable<EntryAgent["session"]>): "ask" | "never";
+  request(input: {agent: EntryAgent; toolName: string; callId: string; reason: string; signal: AbortSignal}): Promise<"allowed-once" | "rejected" | "cancelled" | "unavailable">;
+}
 interface Questions {ask(input: {agent: EntryAgent; signal: AbortSignal; wait: {callId: string}; questions: Array<{id: string; question: string; detail: string}>}): Promise<{answers: Array<{id: string; selected: string[]; custom?: string}>}>}
 interface Options {ctx: HostContext; tasks: TaskService; ledger: TokenLedger; experts(fresh?: boolean): Promise<ExpertRef[]>; isManaged(agent: EntryAgent): boolean; ready(): boolean; workspace: string}
 const string = {type: "string", minLength: 1, maxLength: 2000};
@@ -24,16 +33,61 @@ const strings = (maxItems: number) => ({type: "array", minItems: 1, maxItems, un
 const integer = {type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER};
 const taskIdSchema = {...string, maxLength: 128};
 const versionSchema = {type: "integer", minimum: 1};
-const criterionSchema = object({id: {type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}, text: string}, ["id", "text"]);
-const assignmentSchema = object({relPath: string, deliverables: strings(32), waitFor: object({fromRelPath: string, artifactRefs: strings(32)}, ["fromRelPath", "artifactRefs"])}, ["relPath", "deliverables"]);
+const criterionSchema = object({id: {type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}, text: string,verification:{type:"array",minItems:1,uniqueItems:true,items:{type:"string",enum:["review","command","browser"]}}}, ["id", "text"]);
+const verificationPlanSchema=object({workspace:string,checks:{type:"array",minItems:1,maxItems:64,items:object({id:string,kind:{type:"string",enum:["command","browser"]},criterionIds:strings(32),purpose:string,program:string,args:{type:"array",maxItems:128,items:{type:"string",maxLength:8192}},timeoutMs:{type:"integer",minimum:1000,maximum:300000}},["id","kind","criterionIds","purpose","program","args","timeoutMs"])}},["workspace","checks"]);
+const scopeSchema=object({included:{type:"array",maxItems:32,uniqueItems:true,items:string},excluded:{type:"array",maxItems:32,uniqueItems:true,items:string}},["included","excluded"]);
+function scopeOf(value:unknown):VerificationScope{const r=args(value);if(Object.keys(r).some(k=>!["included","excluded"].includes(k)))throw Error("验收范围含未知字段");const list=(v:unknown)=>{if(!Array.isArray(v)||v.length>32)throw Error("验收范围须为最多32条的列表");const out=v.map(x=>text(x,"范围"));if(new Set(out).size!==out.length)throw Error("范围重复");return out};return {included:list(r.included),excluded:list(r.excluded)};}
+const assignmentSchema = object({relPath: string, deliverables: strings(128), module: string, responsibilities: strings(32), criterionIds: strings(32), coverageRationale: string,
+  batches: {type:"array",minItems:1,maxItems:32,items:object({id:string,title:string,deliverables:strings(4)},["id","title","deliverables"])},
+  waitFor: object({fromRelPath: string, artifactRefs: strings(32)}, ["fromRelPath", "artifactRefs"])}, ["relPath", "deliverables"]);
+const workModulesSchema = {type:"array",minItems:1,maxItems:32,items:object({id:string,title:string,scope:string,leadRelPath:string,
+  contributors:strings(8),criterionIds:strings(32),deliverables:strings(128),dependsOn:strings(32)},["id","title","scope","leadRelPath","criterionIds","deliverables"])};
 function args(value: unknown): Record<string, unknown> {if (!value || typeof value !== "object" || Array.isArray(value)) throw Error("参数必须是对象"); return value as Record<string, unknown>}
 function text(value: unknown, label: string): string {if (typeof value !== "string" || !value.trim() || value.length > 2000) throw Error(`${label}必须是1..2000字的文本`); return value.trim()}
 function number(value: unknown, label: string, min = 0): number {if (!Number.isSafeInteger(value) || (value as number) < min) throw Error(`${label}必须是大于等于${min}的安全整数`); return value as number}
 function texts(value: unknown, label: string, max = 32): string[] {if (!Array.isArray(value) || !value.length || value.length > max) throw Error(`${label}数量无效`); const items = value.map(v => text(v, label)); if (new Set(items).size !== items.length) throw Error(`${label}不能重复`); return items}
 function criteriaOf(value: unknown) {
   if (!Array.isArray(value) || !value.length || value.length > 32) throw Error("完成标准数量无效");
-  const criteria = value.map(c => {const r = args(c), id = text(r.id, "标准编号"); if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(id)) throw Error("标准编号无效"); return {id, text: text(r.text, "完成标准")}});
+  const criteria = value.map(c => {const r = args(c), id = text(r.id, "标准编号"); if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(id)) throw Error("标准编号无效");
+    if(r.verification!==undefined&&(!Array.isArray(r.verification)||!r.verification.length||r.verification.some(m=>!["review","command","browser"].includes(m))))throw Error("verification须为review/command/browser列表");
+    return {id, text: text(r.text, "完成标准"),...(r.verification!==undefined?{verification:[...r.verification] as Array<"review"|"command"|"browser">}:{})}});
   if (new Set(criteria.map(c => c.id)).size !== criteria.length) throw Error("完成标准编号不能重复"); return criteria;
+}
+
+function parseVerificationPlan(value:unknown,criteria:import("./types.js").Criterion[],workspace:string):VerificationPlan {
+  const raw=args(value);if(Object.keys(raw).some(k=>!["workspace","checks"].includes(k))||!Array.isArray(raw.checks))throw Error("实测计划字段无效");
+  const root=text(raw.workspace,"验证项目目录"),rel=relative(resolve(workspace),resolve(root));
+  if(!isAbsolute(root)||isAbsolute(rel)||rel===".."||rel.startsWith(`..${sep}`))throw Error("验证项目目录须位于任务工作目录内");
+  const plan:VerificationPlan={workspace:root,checks:raw.checks.map(item=>{const r=args(item);
+    if(Object.keys(r).some(k=>!["id","kind","criterionIds","purpose","program","args","timeoutMs"].includes(k)))throw Error("验证检查含未知字段");
+    if(!Array.isArray(r.args)||r.args.some(a=>typeof a!=="string"))throw Error("验证args须为字符串列表");
+    return {id:text(r.id,"检查ID"),kind:r.kind as "command"|"browser",criterionIds:texts(r.criterionIds,"检查标准"),purpose:text(r.purpose,"检查行为"),program:text(r.program,"验证程序"),args:[...r.args] as string[],timeoutMs:number(r.timeoutMs,"检查超时",1000)};
+  })};
+  const errors=validateVerificationPlan({criteria,verificationPlan:plan});if(errors.length)throw Error(errors.join("；"));return plan;
+}
+
+function assignmentsOf(value:unknown):ExecutorAssignment[]{
+  if(!Array.isArray(value)||!value.length||value.length>8)throw Error("分工数量无效");
+  return (value as unknown[]).map(item => {const r = args(item);
+          if(Object.keys(r).some(k=>!["relPath","deliverables","module","responsibilities","criterionIds","coverageRationale","batches","waitFor"].includes(k)))throw Error("分工含未知字段");
+          if(r.batches!==undefined&&(!Array.isArray(r.batches)||r.batches.length<1||r.batches.length>32))throw Error("批次数量无效");
+          return {relPath: text(r.relPath, "分工专家"), deliverables: texts(r.deliverables, "分工交付物",128),
+            ...(r.module!==undefined?{module:text(r.module,"模块")}:{}),...(r.responsibilities!==undefined?{responsibilities:texts(r.responsibilities,"职责")}:{}),
+            ...(r.criterionIds!==undefined?{criterionIds:texts(r.criterionIds,"模块标准")}:{}),...(r.coverageRationale!==undefined?{coverageRationale:text(r.coverageRationale,"兼任说明")}:{}),
+            ...(r.batches!==undefined?{batches:(r.batches as unknown[]).map(b=>{const v=args(b);if(Object.keys(v).some(k=>!["id","title","deliverables"].includes(k)))throw Error("批次含未知字段");return {id:text(v.id,"批次编号"),title:text(v.title,"批次目标"),deliverables:texts(v.deliverables,"批次文件",4)}})}:{}),
+            ...(r.waitFor ? {waitFor: {fromRelPath: text(args(r.waitFor).fromRelPath, "前置专家"), artifactRefs: texts(args(r.waitFor).artifactRefs, "交接产物")}} : {})}});
+}
+
+function workModulesOf(value:unknown):WorkModule[] {
+  if (!Array.isArray(value)||!value.length||value.length>32) throw Error("业务模块数量无效");
+  return value.map(item=>{
+    const r=args(item);
+    if(Object.keys(r).some(k=>!["id","title","scope","leadRelPath","contributors","criterionIds","deliverables","dependsOn"].includes(k)))throw Error("业务模块含未知字段");
+    return {id:text(r.id,"业务模块编号"),title:text(r.title,"业务模块名称"),scope:text(r.scope,"业务边界"),leadRelPath:text(r.leadRelPath,"模块负责人"),
+      criterionIds:texts(r.criterionIds,"模块标准"),deliverables:texts(r.deliverables,"模块交付物",128),
+      ...(r.contributors!==undefined?{contributors:texts(r.contributors,"模块协作者",8)}:{}),
+      ...(r.dependsOn!==undefined?{dependsOn:texts(r.dependsOn,"业务依赖")}:{}),};
+  });
 }
 
 /** 用户会话工具适配层。所有任务变更复用TaskService；不产生任何独立模型调用。 */
@@ -58,15 +112,26 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
     const v = o.tasks.currentVersion(t);
     return {taskId: t.id, version: v.version, goal: v.goal, criteria: v.criteria, deliverables: v.deliverables,
       executors: v.executors.map(e => ({relPath: e.relPath, name: e.name, contentHash: e.contentHash})), acceptor: {relPath: v.acceptor.relPath, name: v.acceptor.name, contentHash: v.acceptor.contentHash},
-      assignments: v.assignments ?? [], requiredTools: v.requiredTools ?? [], budget: v.budget.money ?? v.budget,
-      staffingReview: reviewStaffing(v.goal, v.executors, v.acceptor)};
+      assignments: v.assignments ?? [], requiredTools: v.requiredTools ?? [], acceptorRequiredTools:v.acceptorRequiredTools ?? [], budget: v.budget.money ?? v.budget,
+      workModules:v.workModules ?? [],staffingRationale:v.staffingRationale ?? null,
+      workKind:taskWorkKind(v.goal,v.workKind),verificationScope:v.verificationScope??null,
+      verificationPlan:v.verificationPlan??null,verificationReview:verificationReview(v),verificationPlanErrors:validateVerificationPlan(v),
+      staffingReview: reviewStaffing(v.goal, v.executors, v.acceptor),
+      executionPlanValidation: v.executionPlanVersion ? validateExecutionPlan(v) : null,
+      batchProgress: o.tasks.getBatchProgress(t.id)};
   };
   const fingerprint = (t: Task) => createHash("sha256").update(JSON.stringify(plan(t))).digest("hex");
   const budgetView = (t: Task) => {const b = o.ledger.getBudget(t.id), p = o.tasks.currentVersion(t).budget; if (p.money) return o.ledger.moneyView(t.id) ?? {currency: "CNY", limitAmount: null, suggestedAmount: p.money.suggestedAmount ?? null, requiresUserAmount: true}; return {limitTokens: b?.limitTokens ?? p.limitTokens, settledTokens: b?.settledTokens ?? 0, reservedTokens: b?.reservedTokens ?? 0, availableTokens: b ? b.limitTokens - b.settledTokens - b.reservedTokens : p.limitTokens, strict: b?.strict ?? p.strict}};
   const view = (t: Task) => {
     const b = o.ledger.getBudget(t.id), p = plan(t);
     const evidence = o.tasks.getTaskEvidence(t.id), pauseEvent = evidence.eventOrder.map(id => evidence.events[id] as {type?: string; payload?: {note?: string}}).filter(e => e.type === "task.paused").at(-1);
+    const runs=Object.values(evidence.collections[VERIFICATION_RUNS]??{}) as VerificationRun[];
+    const delivered=evidence.eventOrder.map(id=>evidence.events[id] as {type?:string;taskVersion?:number;payload?:{roundId:string;verdicts:import("./types.js").Verdict[];artifactHashes:Record<string,string>}}).findLast(e=>e.type==="task.delivered"&&e.taskVersion===p.version);
+    const round=delivered?.payload?.roundId?evidence.collections.acceptanceRounds?.[delivered.payload.roundId] as {checkpoint?:{stepEpoch?:number}}|undefined:undefined;
+    const missing=delivered?.payload?missingVerification(o.tasks.currentVersion(t),delivered.payload.verdicts,runs,delivered.payload.roundId,round?.checkpoint?.stepEpoch??0,delivered.payload.artifactHashes):[];
     return {...p, routerSessionId: t.routerSessionId ?? null, relatedTaskId: t.relatedTaskId, relationKind: t.relationKind, status: t.status, pauseReason: t.pauseReason, pauseNote: t.status === "paused" ? pauseEvent?.payload?.note ?? null : null, waiting: t.waitingOn,
+      finalAcceptanceEvidence:(Object.values(evidence.collections[DELIVERY_EVIDENCE]??{}) as DeliveryEvidence[]).filter(r=>r.version===p.version).map(r=>({id:r.id,version:r.version,roundId:r.roundId,exportState:r.exportState,paths:r.paths??null,lastError:r.lastError??null,scope:r.snapshot.scope,missingRuntimeEvidence:r.snapshot.missingRuntimeEvidence})),
+      runtimeVerification:{required:p.verificationReview.some(c=>c.methods.some(m=>m!=="review")),verified:Boolean(delivered)&&missing.length===0,missing,runs:runs.map(r=>({id:r.id,checkId:r.checkId,kind:r.kind,status:r.status,version:r.version,roundId:r.roundId,logPath:r.logPath,summary:r.summary.slice(-512)}))},
       pendingApprovals: pendingApprovals(evidence, t.id)
         .map(a => ({sessionId: a.sessionId, expert: a.relPath, role: a.role, requestId: a.requestId, toolName: a.toolName, reason: a.reason})),
       accountingIssue: o.ledger.accountingIssue(t.id) ?? null, unknownAnswerDelivery: o.tasks.getClarificationAnswers(t.id).some(a => a.delivery === "unknown"),
@@ -78,12 +143,15 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
     checkEpoch(t.id, ticket);
     const approval = o.ctx.get<Approval>("approval");
     const p = plan(t), b = o.ledger.getBudget(t.id);
+    const validation = o.tasks.currentVersion(t).executionPlanVersion ? validateExecutionPlan(o.tasks.currentVersion(t)) : null;
+    const verificationErrors=validateVerificationPlan(o.tasks.currentVersion(t));if(verificationErrors.length)throw Error("验收实测计划未完整："+verificationErrors.join("；"));
+    if(validation&&!validation.valid) throw Error("职责/模块/批次计划未完整，未开工："+validation.errors.join("；"));
     const money = o.tasks.currentVersion(t).budget.money;
     const reason = [operation ?? (name === "longtask_confirm" ? "确认按以下方案开始长任务" : "确认在原预算内恢复长任务"), `任务：${t.id}；方案版本：${p.version}`,
       `目标：${p.goal}`, "完成标准：", ...p.criteria.map(c => `- ${c.id}：${c.text}`), "交付物：", ...p.deliverables.map(d => `- ${d}`),
       `执行专家：${p.executors.map(e => `${e.name}（${e.relPath}）`).join("、")}`, `独立验收：${p.acceptor.name}（${p.acceptor.relPath}）`,
       ...(p.staffingReview.needsDiscussion.length ? [`职责覆盖提醒：${p.staffingReview.needsDiscussion.map(r=>r.label).join("、")}未选专职专家，可由现有人选兼任；请核对分工和完成标准中由谁负责，不会自动增加专家或预算。`] : []),
-      `分工：${JSON.stringify(p.assignments)}`, `任务工作目录：${o.workspace}`, money ?
+      `工作种类：${p.workKind}；分工：${JSON.stringify(p.assignments)}`,`验收包含/排除范围：${JSON.stringify(p.verificationScope)}`,`逐条验收方式：${JSON.stringify(p.verificationReview)}；独立实测负责人：${p.acceptor.relPath}`,`实测计划（在临时副本沙箱执行）：${JSON.stringify(p.verificationPlan)}`, `任务工作目录：${o.workspace}`, money ?
         `人民币总上限：${money.limitAmount === null ? "待您填写" : "¥" + money.limitAmount}；核算账本：${JSON.stringify(o.ledger.moneyView(t.id))}。${money.suggestedAmount ? `Agent建议¥${money.suggestedAmount}，仅供参考。` : ""}\n按模型价格与用量核算；内置价格按高峰价保守核算，不是平台实扣；预算仅含本任务托管模型请求，第三方付费工具不在其中。` :
         `历史任务固定Token上限：${o.tasks.currentVersion(t).budget.limitTokens}；已用：${b?.settledTokens ?? 0}；在途：${b?.reservedTokens ?? 0}`,
       "不自动追加额度；只有独立验收通过才交付。"].join("\n");
@@ -102,9 +170,10 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
         return {limitAmount: formatCny(amount), sessionId: exec.agent!.session!.id!, callId: exec.callId};
       }
       if (typeof approval?.request !== "function") throw Error("宿主没有用户确认通道；任务保持原状，未启动");
+      if (approval.effectivePolicy?.(exec.agent!.session!) === "never") throw Error("宿主当前会话审批策略为 never，确认请求会被自动拒绝；任务保持原状。请由用户将该会话审批策略切换为 ask（允许审批提示），再重试本操作；重复发送继续不能解除此限制。插件不会自行修改审批策略。");
       const result = await approval.request({agent: exec.agent!, toolName: name, callId: exec.callId, reason, signal});
       signal.throwIfAborted(); assertCaller(exec); checkEpoch(t.id, ticket);
-      if (result !== "allowed-once") throw Error(result === "rejected" ? "用户未确认，任务保持原状" : "用户确认未完成，任务保持原状");
+      if (result !== "allowed-once") throw Error(result === "rejected" ? "宿主拒绝了本次确认；该结果不代表用户一定点击了拒绝，请核对当前会话审批策略和确认记录。任务保持原状，不自动重试。" : result === "cancelled" ? "确认已取消，任务保持原状" : "宿主确认通道当前不可用，任务保持原状；请检查审批服务后重试");
     } finally {pending.delete(controller); if (!pending.size) approvalControllers.delete(t.id)}
   };
   const checkExperts = async (t: Task, exec: Execution) => {
@@ -113,6 +182,8 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
     if ([...v.executors, v.acceptor].some(e => current.get(e.relPath) !== e.contentHash)) throw Error("专家定义已变更，请更新方案并重新核对后确认");
   };
   const define = (name: string, description: string, parameters: Record<string, unknown>, run: (a: Record<string, unknown>, exec: Execution) => Promise<unknown>) => {
+    if(name==="longtask_propose")description+=" workKind区分development/verification/document。已有系统复验使用verification，可只交付报告，既有测试脚本作为verificationPlan输入，不要求新增源码或开发模块。verificationScope写明包含与排除范围。软件新方案须逐条在criteria.verification声明review/command/browser（可多选）；要求运行测试、启动或浏览器操作的标准不能只选review。command/browser标准须提供verificationPlan：workspace项目绝对目录；checks列id、kind、criterionIds、purpose、program、args、timeoutMs。新增检查脚本须实际断言行为并列入交付分工；独立验收通过longtask_verify在副本沙箱实际执行。缺计划或执行能力不能开工，缺真实成功记录不能交付。";
+    if(name==="longtask_control")description+=" verify可一次提交原标准ID的criteria修订、verificationPlan和verificationScope；用户确认时展示修订前后差异，沿用原任务与预算，仅重开验收。reopen同样可携带计划与范围。";
     stops.push(tools.register({name, description, parameters, output: {schema: {type: "string"}, render: (_args, value) => [{type: "text", text: value}]},
       execute(value, exec) {
         const call = (async () => {
@@ -124,7 +195,7 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
       }}));
   };
   try {
-    define("longtask_experts", "中文或英文检索本地专家。提交方案前用task传完整目标与技术栈，查看职责及候选推荐，再按复杂度与预算确定分工；小任务可兼任，不固定前后端两人。query可额外过滤目录页，不裁掉task职责推荐。仅返回元数据，专家全文派工时注入，不启动Worker。", object({query: {type: "string", maxLength: 200}, task: string, offset: integer, limit: {type: "integer", minimum: 1, maximum: 50}}), async (a, exec) => {
+    define("longtask_experts", "中文或英文检索本地专家。开发任务先从需求列出业务模块、边界和标准，再用task传完整目标与技术栈查询各模块职责缺口与候选，按复杂度与预算确定专家；不要从默认前端/后端两人倒推模块。小任务可兼任。query可额外过滤目录页，不裁掉task职责推荐。仅返回元数据，专家全文派工时注入，不启动Worker。", object({query: {type: "string", maxLength: 200}, task: string, offset: integer, limit: {type: "integer", minimum: 1, maximum: 50}}), async (a, exec) => {
       const query = typeof a.query === "string" ? a.query.toLowerCase().trim() : "", offset = a.offset === undefined ? 0 : number(a.offset, "offset"), limit = a.limit === undefined ? 20 : number(a.limit, "limit", 1);
       if (a.query !== undefined && (typeof a.query !== "string" || a.query.length > 200)) throw Error("query必须是不超过200字的文本");
       if (limit > 50) throw Error("limit最大为50"); const taskText = a.task === undefined ? query : text(a.task,"任务目标"),catalog = await o.experts();
@@ -134,36 +205,45 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
         recommendation:recommendExperts(catalog,taskText),
         experts: items.slice(offset, offset + limit).map(({expert:{relPath,name,division,intro},score,matchedResponsibilities})=>({relPath,name,division,intro,score,matchedResponsibilities}))};
     });
-    define("longtask_propose", "生成待确认长任务方案，支持修改尚未启动的方案。必须明确目标、标准、绝对交付路径、执行和独立验收专家；可提供suggestedBudgetCny作为人民币预算建议。实际金额必须由用户在longtask_confirm的宿主输入框填写，Agent不能设定总上限；有歧义先澄清。不启动Worker。", object({
-      goal: string, criteria: {type: "array", minItems: 1, maxItems: 32, items: criterionSchema}, deliverables: strings(32), executorRelPaths: strings(8), acceptorRelPath: string, suggestedBudgetCny: {type: "string", pattern: "^(0|[1-9][0-9]{0,6})(\\.[0-9]{1,9})?$"},
-      assignments: {type: "array", minItems: 1, maxItems: 8, items: assignmentSchema}, taskId: taskIdSchema, expectedVersion: versionSchema, parentTaskId: taskIdSchema,
+    define("longtask_propose", "生成待确认长任务方案。软件任务先拆业务模块再选专家：workModules须给id、title、scope、leadRelPath、criterionIds、deliverables，可含contributors和dependsOn；不能只把前端/后端当业务模块。三个及以上业务模块只选1~2位专家时须staffingRationale说明合并、分批和测试安排，否则增选专家。按推荐的职责ID明确负责人：assignments含module、responsibilities、criterionIds、batches；兼任多职责须coverageRationale说明。源码/测试文件列入deliverables及所属模块，每批1..4文件，执行按批交回。缺职责或批次则禁止确认，先修正executionPlanValidation.errors。按业务模块细分专家，多个模块可承担同类职责、共同引用完成标准；每个交付文件仍唯一归属。保留独立验收。需要联网、预览或隔离验证时声明acceptorRequiredTools，确认前核对宿主能力。金额由用户在longtask_confirm填写，Agent不能代填。不启动Worker。", object({
+      goal: string, criteria: {type: "array", minItems: 1, maxItems: 32, items: criterionSchema}, deliverables: strings(128), executorRelPaths: strings(8), acceptorRelPath: string, suggestedBudgetCny: {type: "string", pattern: "^(0|[1-9][0-9]{0,6})(\\.[0-9]{1,9})?$"},
+      assignments: {type: "array", minItems: 1, maxItems: 8, items: assignmentSchema}, workModules:workModulesSchema,staffingRationale:string,verificationPlan:verificationPlanSchema,verificationScope:scopeSchema,workKind:{type:"string",enum:["development","verification","document"]},acceptorRequiredTools:strings(32), taskId: taskIdSchema, expectedVersion: versionSchema, parentTaskId: taskIdSchema,
     }, ["goal", "criteria", "deliverables", "executorRelPaths", "acceptorRelPath"]), async (a, exec) => {
       if (!isAbsolute(o.workspace) || !statSync(o.workspace, {throwIfNoEntry: false})?.isDirectory()) throw Error("任务工作目录尚未配置为存在的绝对目录；请先设置workerCwd");
-      const goal = text(a.goal, "目标"), deliverables = texts(a.deliverables, "交付路径"), paths = texts(a.executorRelPaths, "执行专家", 8), acceptorPath = text(a.acceptorRelPath, "验收专家");
+      const goal = text(a.goal, "目标"), deliverables = texts(a.deliverables, "交付路径",128), paths = texts(a.executorRelPaths, "执行专家", 8), acceptorPath = text(a.acceptorRelPath, "验收专家");
       if (!deliverables.every(isAbsolute)) throw Error("交付物必须使用绝对路径；请先确认任务工作目录");
       const criteria = criteriaOf(a.criteria);
+      if(a.workKind!==undefined&&!["development","verification","document"].includes(String(a.workKind)))throw Error("workKind无效");
+      const workKind=taskWorkKind(goal,a.workKind as TaskWorkKind|undefined);
       if (paths.includes(acceptorPath)) throw Error("验收专家必须独立于执行专家");
       const catalog = new Map((await o.experts(true)).map(e => [e.relPath, e])); assertCaller(exec);
       const expert = (path: string) => {const found = catalog.get(path); if (!found) throw Error("专家不在本地目录：" + path); return found};
       let assignments: ExecutorAssignment[];
       if (a.assignments !== undefined) {
         if (!Array.isArray(a.assignments) || !a.assignments.length || a.assignments.length > 8) throw Error("分工数量无效");
-        assignments = a.assignments.map(item => {const r = args(item); return {relPath: text(r.relPath, "分工专家"), deliverables: texts(r.deliverables, "分工交付物"), ...(r.waitFor ? {waitFor: {fromRelPath: text(args(r.waitFor).fromRelPath, "前置专家"), artifactRefs: texts(args(r.waitFor).artifactRefs, "交接产物")}} : {})}});
+        assignments = assignmentsOf(a.assignments);
       } else {if (paths.length !== 1) throw Error("多位执行专家必须明确各自assignments分工"); assignments = [{relPath: paths[0]!, deliverables}]}
       const suggestedAmount = a.suggestedBudgetCny === undefined ? undefined : formatCny(parseCny(a.suggestedBudgetCny as string));
       const input: ProposeInput = {goal, criteria, deliverables, executors: paths.map(expert), acceptor: expert(acceptorPath), assignments,
+        workKind,...(a.verificationScope!==undefined?{verificationScope:scopeOf(a.verificationScope)}:{}),
+        ...(reviewStaffing([goal,...criteria.map(c=>c.text)].join("\n"),paths.map(expert),expert(acceptorPath)).domain==="software"?{verificationPolicyVersion:1 as const}:{}),
+        ...(a.verificationPlan!==undefined?{verificationPlan:parseVerificationPlan(a.verificationPlan,criteria,o.workspace)}:{}),
+        ...(a.workModules!==undefined?{workModules:workModulesOf(a.workModules)}:{}),
+        ...(a.staffingRationale!==undefined?{staffingRationale:text(a.staffingRationale,"配员依据")}:{}),
+        ...(a.acceptorRequiredTools!==undefined?{acceptorRequiredTools:texts(a.acceptorRequiredTools,"验收所需工具")}:{}),
+        ...(workKind==="development"&&reviewStaffing([goal,...criteria.map(c=>c.text)].join("\n"),paths.map(expert),expert(acceptorPath)).domain==="software"?{executionPlanVersion:2 as const}:assignments.some(a=>a.batches)?{executionPlanVersion:1 as const}:{}),
         budget: {limitTokens: Number.MAX_SAFE_INTEGER, strict: true, money: {currency: "CNY", limitAmount: null, ...(suggestedAmount ? {suggestedAmount} : {})}}};
-      if (JSON.stringify(input).length > 24000) throw Error("方案过长，请精简为可核对的目标和标准");
+      if (JSON.stringify(input).length > 48000) throw Error("方案过长，请精简为可核对的目标和标准");
       if ((a.taskId === undefined) !== (a.expectedVersion === undefined)) throw Error("调整方案需同时给出taskId和expectedVersion");
       if (a.parentTaskId !== undefined && a.taskId !== undefined) throw Error("关联新要求与修改原方案不能混用");
       if (a.taskId !== undefined) return locked(text(a.taskId, "任务ID"), async () => {
         assertCaller(exec); const t = task(text(a.taskId, "任务ID"));
         if (t.status !== "proposed" || t.versions.some(v => v.confirmedAt) || o.tasks.getSessions(t.id).length) throw Error("只能修改从未启动的待确认方案");
         if (o.tasks.currentVersion(t).version !== number(a.expectedVersion, "方案版本", 1)) throw Error("方案版本已变化，请先查看最新方案");
-        await o.tasks.proposeNewVersion(t.id, input); invalidate(t.id); return {task: view(task(t.id)), recommendation: recommendExperts([...catalog.values()],goal), next: "请先核对staffingReview和职责候选，明确兼任安排，再由用户确认当前版本；使用longtask_confirm完成宿主确认后才开始"};
+        await o.tasks.proposeNewVersion(t.id, input); invalidate(t.id); return {task: view(task(t.id)), recommendation: recommendExperts([...catalog.values()],[goal,...criteria.map(c=>c.text)].join("\n")), next: "请先核对staffingReview和职责候选，明确兼任安排，再由用户确认当前版本；使用longtask_confirm完成宿主确认后才开始"};
       });
       const parent = a.parentTaskId === undefined ? undefined : text(a.parentTaskId, "父任务ID"); if (parent) task(parent);
-      assertCaller(exec); const t = await o.tasks.propose(input, parent, parent ? "child" : "none", exec.agent!.session!.id!); return {task: view(t), recommendation: recommendExperts([...catalog.values()],goal), next: "方案尚未执行；先核对staffingReview与职责候选，明确兼任安排。用户可调整，使用longtask_confirm展示方案并完成宿主确认"};
+      assertCaller(exec); const t = await o.tasks.propose(input, parent, parent ? "child" : "none", exec.agent!.session!.id!); return {task: view(t), recommendation: recommendExperts([...catalog.values()],[goal,...criteria.map(c=>c.text)].join("\n")), next: "方案尚未执行；先核对staffingReview与职责候选，明确兼任安排。用户可调整，使用longtask_confirm展示方案并完成宿主确认"};
     });
     define("longtask_confirm", "将当前方案交给宿主展示给用户确认；仅用户同意后启动。必须传入longtask_propose/longtask_tasks返回的taskId和version；不接受模型代填已确认标记，不追加预算。", object({taskId: taskIdSchema, version: versionSchema}, ["taskId", "version"]), async (a, exec) => {
       const id = text(a.taskId, "任务ID"), version = number(a.version, "方案版本", 1), original = task(id);
@@ -179,13 +259,24 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
         return await locked(id, async () => {assertCaller(exec); checkEpoch(id, ticket); const fresh = task(id); if (fresh.status !== "proposed" || fingerprint(fresh) !== stamp) throw Error("确认期间方案或状态已变化，未启动；请核对最新方案"); await o.tasks.confirm(id, 0, version, moneyApproval, exec.agent!.session!.id!); return {task: view(task(id)), started: true}});
       } finally {confirming.delete(id)}
     });
-    define("longtask_control", "按用户意图管理任务：pause暂停、resume恢复、cancel取消；answer以text回答任务澄清；supplement补充信息；clarify暂停并提具体问题；reopen按criteria纠错重开已交付任务；replace_executor以addRelPath替换removeRelPath。reopen/replace_executor必须带expectedVersion。答复恢复、重开、换人需宿主确认且不增加预算。新增要求用longtask_propose的parentTaskId单独建方案。有歧义先询问，结果未知不重投。", object({taskId: taskIdSchema, action: {type: "string", enum: ["pause", "resume", "cancel", "answer", "supplement", "clarify", "reopen", "replace_executor"]}, reason: string, text: string, expectedVersion: versionSchema,
-      criteria: {type: "array", minItems: 1, maxItems: 32, items: criterionSchema}, addRelPath: string, removeRelPath: string, pendingItems: strings(32)}, ["taskId", "action"]), async (a, exec) => {
+    define("longtask_control", "按用户意图管理任务：pause暂停、resume恢复、cancel取消；answer回答澄清；supplement补充；clarify提问；reopen修订标准；replace_executor换人。verify以verificationPlan补齐实测计划，适用于已交付或missing_input暂停任务：需expectedVersion并由用户确认，保留原产物与预算，仅重开独立验收。新增要求另建方案。结果未知不重投。", object({taskId: taskIdSchema, action: {type: "string", enum: ["pause", "resume", "cancel", "answer", "supplement", "clarify", "reopen", "replace_executor","verify"]}, reason: string, text: string, expectedVersion: versionSchema,verificationPlan:verificationPlanSchema,
+      criteria: {type: "array", minItems: 1, maxItems: 32, items: criterionSchema},verificationScope:scopeSchema, assignments:{type:"array",minItems:1,maxItems:8,items:assignmentSchema},workModules:workModulesSchema,staffingRationale:string, addRelPath: string, removeRelPath: string, pendingItems: strings(32)}, ["taskId", "action"]), async (a, exec) => {
       const id = text(a.taskId, "任务ID"), action = a.action, reason = a.reason === undefined ? "用户从正式入口操作" : text(a.reason, "原因"); task(id);
-      const fields: Record<string, string[]> = {pause: [], cancel: [], resume: [], answer: ["text"], supplement: ["text"], clarify: ["text"], reopen: ["criteria", "expectedVersion"], replace_executor: ["addRelPath", "removeRelPath", "pendingItems", "expectedVersion"]};
+      const fields: Record<string, string[]> = {pause: [], cancel: [], resume: [], answer: ["text"], supplement: ["text"], clarify: ["text"], reopen: ["criteria", "expectedVersion","assignments","workModules","staffingRationale","verificationPlan","verificationScope"], replace_executor: ["addRelPath", "removeRelPath", "pendingItems", "expectedVersion"],verify:["verificationPlan","expectedVersion","criteria","verificationScope"]};
       if (typeof action !== "string" || !fields[action]) throw Error("不支持的任务操作");
       if (Object.keys(a).some(k => !["taskId", "action", "reason", ...fields[action]!].includes(k))) throw Error("参数与当前操作不匹配");
       if (action === "pause" || action === "cancel") {invalidate(id); return locked(id, async () => {assertCaller(exec); if (action === "pause" && task(id).status === "proposed") return {task: view(task(id)), notStarted: true}; if (action === "pause") await o.tasks.pause(id, "user", reason); else await o.tasks.cancel(id); return {task: view(task(id))}})}
+      if(action==="verify"){
+        const original=task(id),version=number(a.expectedVersion,"方案版本",1),stamp=fingerprint(original),ticket=epoch(id);
+        if(o.tasks.currentVersion(original).version!==version||!(original.status==="delivered"||(original.status==="paused"&&original.pauseReason==="missing_input")))throw Error("仅可为当前已交付或待补能力的暂停任务补测");
+        const preview=structuredClone(original),v=preview.versions[preview.currentVersion]!;
+        const criteria=a.criteria===undefined?undefined:criteriaOf(a.criteria),scope=a.verificationScope===undefined?undefined:scopeOf(a.verificationScope);
+        if(criteria)for(const c of criteria){const at=v.criteria.findIndex(x=>x.id===c.id);if(at<0)throw Error("verify只能修订原标准；新增要求用reopen");v.criteria[at]={...v.criteria[at]!,...c};}
+        if(scope)v.verificationScope=scope;
+        const verificationPlan=parseVerificationPlan(a.verificationPlan,v.criteria,o.workspace);v.verificationPlan=verificationPlan;
+        await checkExperts(preview,exec);await approve("longtask_control",preview,exec,ticket,`确认将原任务v${version}修订为v${version+1}并补测，沿用原预算，仅重开独立验收。原因：${reason}\n标准变化：${JSON.stringify(criteria?.map(c=>({before:o.tasks.currentVersion(original).criteria.find(x=>x.id===c.id),after:c}))??[])}\n验收范围：${JSON.stringify(scope??v.verificationScope??null)}`);
+        return locked(id,async()=>{assertCaller(exec);checkEpoch(id,ticket);const fresh=task(id);if(fresh.status!==original.status||fingerprint(fresh)!==stamp)throw Error("补测确认期间任务已变化");await o.tasks.bindRouter(id,exec.agent!.session!.id!);await o.tasks.configureVerification(id,verificationPlan,version,{...(criteria?{criteria}:{}),...(scope?{scope}:{}),reason});invalidate(id);return {task:view(task(id))};});
+      }
       if (action === "clarify" || action === "supplement") {
         const body = text(a.text, action === "clarify" ? "具体问题" : "补充信息");
         if (!["active", "rework"].includes(task(id).status)) throw Error("只有执行或返工任务接受补充/澄清；不解除其他暂停");
@@ -209,10 +300,18 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
           if (action === "reopen") {
             if (status !== "delivered") throw Error("纠错重开仅用于已交付任务；运行中修改标准需先停下核对");
             const criteria = criteriaOf(a.criteria);
+            const assignments=a.assignments===undefined?undefined:assignmentsOf(a.assignments);
+            const workModules=a.workModules===undefined?undefined:workModulesOf(a.workModules);
+            const staffingRationale=a.staffingRationale===undefined?undefined:text(a.staffingRationale,"配员依据");
+            if(assignments)v.assignments=assignments;
+            if(workModules)v.workModules=workModules;
+            if(staffingRationale!==undefined)v.staffingRationale=staffingRationale;
             for (const c of criteria) {const at = v.criteria.findIndex(x => x.id === c.id); if (at >= 0) v.criteria[at] = c; else v.criteria.push(c)}
+            const verificationPlan=a.verificationPlan===undefined?undefined:parseVerificationPlan(a.verificationPlan,v.criteria,o.workspace),verificationScope=a.verificationScope===undefined?undefined:scopeOf(a.verificationScope);
+            if(verificationPlan)v.verificationPlan=verificationPlan;if(verificationScope)v.verificationScope=verificationScope;
             if (JSON.stringify(v.criteria) === JSON.stringify(o.tasks.currentVersion(original).criteria)) throw Error("完成标准没有变化，不重复重开");
             v.version++; operation = `确认纠错重开原任务，新版本沿用全部已用费用与固定上限。原因：${reason}`;
-            run = () => o.tasks.reopenWithCriteria(id, {criteria, reason, expectedVersion: version});
+            run = () => o.tasks.reopenWithCriteria(id, {criteria, reason, expectedVersion: version,...(verificationPlan?{verificationPlan}:{}),...(verificationScope?{verificationScope}:{}),...(assignments?{assignments}:{}),...(workModules?{workModules}:{}),...(staffingRationale!==undefined?{staffingRationale}:{})});
           } else {
             if (!["active", "rework"].includes(status)) throw Error("仅执行或返工阶段可以更换执行专家");
             const addPath = text(a.addRelPath, "接手专家"), remove = text(a.removeRelPath, "原执行专家");
@@ -220,6 +319,7 @@ export function registerUserTaskTools(o: Options): {ready: boolean; dispose(): P
             const add = (await o.experts(true)).find(e => e.relPath === addPath); assertCaller(exec); if (!add) throw Error("接手专家不在本地目录");
             const pendingItems = a.pendingItems === undefined ? [] : texts(a.pendingItems, "未完成项");
             v.executors = v.executors.map(e => e.relPath === remove ? add : e);
+            if(v.workModules)v.workModules=v.workModules.map(m=>({...m,leadRelPath:m.leadRelPath===remove?addPath:m.leadRelPath,...(m.contributors?{contributors:m.contributors.map(p=>p===remove?addPath:p)}:{})}));
             v.assignments = v.assignments?.map(s => ({...s, relPath: s.relPath === remove ? addPath : s.relPath, ...(s.waitFor ? {waitFor: {...s.waitFor, fromRelPath: s.waitFor.fromRelPath === remove ? addPath : s.waitFor.fromRelPath}} : {})}));
             operation = `确认更换执行专家：${remove} → ${addPath}。原因：${reason}\n未完成项：${pendingItems.join("；") || "按现有进度接手"}`;
             run = () => o.tasks.changeExecutor(id, {add, remove, reason, pendingItems, expectedVersion: version});

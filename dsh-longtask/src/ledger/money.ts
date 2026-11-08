@@ -65,3 +65,9 @@ export function priceTokenCeiling(p: PriceCard, tokens: number): bigint {
   const rate = [p.input, p.cacheRead, p.cacheWrite, p.output].map(parseCny).reduce((a,b) => a > b ? a : b);
   return (count(tokens) * rate + 999_999n) / 1_000_000n;
 }
+
+export type TokenProjection = number | {inputTokens: number; outputTokens: number; untypedTokens?: number};
+export function priceProjection(p: PriceCard, projection: TokenProjection): bigint {
+  return typeof projection === "number" ? priceTokenCeiling(p,projection)
+    : priceBound(p,projection.inputTokens,projection.outputTokens)+priceTokenCeiling(p,projection.untypedTokens ?? 0);
+}

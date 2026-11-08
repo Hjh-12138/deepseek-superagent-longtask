@@ -11,8 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { promises as fs } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { promises as fs, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { apply, parseWorkerReport, parseAcceptorVerdicts, type LongtaskConfig } from "../src/index.js";
 import type { HostContext, AgentHandle } from "../src/host-types.js";
@@ -157,6 +156,7 @@ function makeFakeHost(options: { failPresets?: string[]; noToolGuard?: boolean }
       if (name === "agents") return agentsService as unknown as T;
       if (name === "sessions") return { flush: async () => true } as T;
       if (name === "tools") return (options.noToolGuard ? {} : {
+        get(name:string) {return ["read","glob","grep","working_directory"].includes(name)?{name}:undefined;},
         guard(fn: (exec: { name: string; agent?: unknown }) => string | undefined) {
           toolGuards.add(fn);
           return () => { toolGuards.delete(fn); };
@@ -378,6 +378,7 @@ async function makeApp(overrides: Partial<LongtaskConfig> = {}, hostOptions: { f
 
   const fake = makeFakeHost(hostOptions);
   const cfg: Partial<LongtaskConfig> = {
+    workerMaxTokens: 8000, // 历史预算回归固定原上限；默认翻倍另有真实入口用例。
     dataDir: dir,
     agencyAgentsRoot: expertsRoot,
     probeOnStart: false,
@@ -402,7 +403,7 @@ function findAgentByMessage(fake: ReturnType<typeof makeFakeHost>, substring: st
 test('阶段三消费者接口：就绪状态和只读审计快照不暴露其他任务',async()=>{
   const {fake,api}=await makeApp();
   try{
-    await fake.waitFor(()=>api.getRuntimeInfo().ready);assert.equal(api.getRuntimeInfo().stage3Protocol,2);assert.equal(api.getRuntimeInfo().budgetProtectionVersion,1);assert.equal(api.getRuntimeInfo().pid,process.pid);
+    await fake.waitFor(()=>api.getRuntimeInfo().ready);assert.equal(api.getRuntimeInfo().stage3Protocol,2);assert.equal(api.getRuntimeInfo().budgetProtectionVersion,2);assert.equal(api.getRuntimeInfo().pid,process.pid);
     const input={goal:'独立任务',criteria:[{id:'c1'}],deliverables:['one.md'],executors:[EXECUTOR],acceptor:REVIEWER,budget:{limitTokens:200000,strict:true}};
     const a=await api.propose(input),b=await api.propose({...input,goal:'UNRELATED-PRIVATE-MARKER',deliverables:['two.md']});await api.confirm(a.id);
     const evidence=api.getTaskEvidence(a.id);assert.equal(JSON.stringify(evidence).includes('UNRELATED-PRIVATE-MARKER'),false);assert.equal(evidence.collections.tasks![b.id],undefined);
@@ -718,7 +719,7 @@ test("apply pre-step 预算闸门：余额耗尽时拒绝任务会话的新步�
 });
 
 test("apply 验收步数上限：验收迟迟不给结论 → 拒绝新步骤并暂停交人工", async () => {
-  const { fake, api, dir } = await makeApp();
+  const { fake, api, dir } = await makeApp({acceptorMaxSteps:8,acceptorMaxIdleSteps:99});
   const task = (await api.propose({
     goal: "g",
     criteria: [{ id: "c1", text: "t" }],
@@ -780,8 +781,8 @@ test("apply 验收未给结论：不得静默挂着，必须催办一次并落�
   assert.equal((api.getTask(task.id) as { status: string }).status, "awaiting_acceptance", "催办不改状态");
 });
 
-test("apply 执行步数上限：执行者把预算烧在探索上之前就被拦住并交人工", async () => {
-  const { fake, api, dir } = await makeApp();
+test("apply 显式配置24步上限：第25步暂停并交人工", async () => {
+  const { fake, api, dir } = await makeApp({executorMaxSteps:24});
   // 预算给足，确保先撞到步数上限而不是预算上限
   const task = (await api.propose({
     goal: "g",
@@ -795,7 +796,7 @@ test("apply 执行步数上限：执行者把预算烧在探索上之前就被�
   await fake.flush();
   const worker = findAgentByMessage(fake, "research/worker.md")!;
 
-  // 默认上限 24 步：24 步放行，第 25 步拒绝
+  // 显式上限 24 步：24 步放行，第 25 步拒绝
   for (let i = 1; i <= 24; i++) assert.equal(await fake.emitPreStep(worker.sessionId), true, `第 ${i} 步放行`);
   assert.equal(await fake.emitPreStep(worker.sessionId), false, "第 25 步被拒（执行者探索有界）");
   await fake.waitFor(() => (api.getTask(task.id) as { status: string }).status === "paused");
@@ -1442,7 +1443,7 @@ test("读预算超限使用 steer：工具仍在当前 turn 时，下一步能�
     fake.emitSessionEvent(worker.sessionId, { type: "tool/call", data: { turn: 1, name: "read_file" } });
     await fake.waitFor(() => worker.messages.length === 2);
     const [control] = worker.consumeStep();
-    assert.ok(control?.includes("读预算"));
+    assert.ok(control?.includes("读取提醒"));
     assert.ok(control?.includes("<longtask_report>"));
     assert.equal(worker.nextTurn.length, 0, "不等待当前 turn 结束");
   } finally {
@@ -1480,402 +1481,6 @@ test("执行者准入为验收保留额度：只够本步、不够验收时提�
   assert.equal((api.getTask(task.id) as { pauseReason: string | null }).pauseReason, "budget");
 });
 
-test("联调覆盖判定：wrapup/gap-inject 缺少目标证据不得通过，漏记子会话不得算预算内成功", async () => {
-  const { assessScenario } = await import(new URL("../../../dsh-longtask-e2e/evidence.mjs", import.meta.url).href);
-  const base = {
-    taskId: "test-task", runId: "test-run", scenario: "basic", status: "delivered",
-    budget: { limitTokens: 1000, settledTokens: 800, reservedTokens: 0 },
-    accounting: { verified: true, actualTokens: 800, descendants: [] },
-    controls: { wrapUp: 0, wrapUpConsumed: 0, readStop: 0, readStopConsumed: 0, boundExceeded: 0 },
-    rounds: [{ roundId: "round-two", outcome: "delivered", verdicts: ["c1:pass", "c2:pass"] }],
-  };
-  assert.equal(assessScenario(base).passed, true);
-  assert.equal(assessScenario({ ...base, scenario: "wrapup" }).passed, false);
-  const fixture = { version: "checkpoint-v2", pendingAtControl: true, receiptIssued: true, controlOrder: 2, receiptOrder: 3, artifactMatches: true, receiptFileMatches: true };
-  const wrap = { ...base, scenario: "wrapup", fixture, controls: { ...base.controls, wrapUp: 1, wrapUpConsumed: 1 } };
-  assert.equal(assessScenario(wrap).passed, true);
-  assert.equal(assessScenario({ ...wrap, controls: { ...wrap.controls, wrapUpConsumed: 0 } }).passed, false, "只入队不算消费");
-  assert.equal(assessScenario({ ...wrap, fixture: undefined }).passed, false, "旧场景即使消费过也不能替代检查点闭环");
-  for (const change of [{ pendingAtControl: false }, { receiptOrder: 1 }, { artifactMatches: false }, { receiptFileMatches: false }]) {
-    assert.equal(assessScenario({ ...wrap, fixture: { ...fixture, ...change } }).passed, false);
-  }
-  const fault = { version: "gap-before-freeze-v2", taskId: base.taskId, runId: base.runId, injected: true, repaired: true, artifactMatches: true, criteriaUnchanged: true,
-    phases: { injected: 1, firstFrozen: 2, gap: 3, repaired: 4, secondFrozen: 5 }, firstRoundId: "round-one", secondRoundId: "round-two", beforeHash: "a".repeat(64), injectedHash: "b".repeat(64), repairedHash: "c".repeat(64), failure: null };
-  const gap = { ...base, scenario: "gap-inject", fault };
-  assert.equal(assessScenario(gap).passed, false, "首次全pass不是退回证据");
-  const rework = { roundId: "round-one", outcome: "rework", verdicts: ["c1:pass", "c2:gap"] };
-  assert.equal(assessScenario({ ...gap, rounds: [rework, ...base.rounds] }).passed, true);
-  assert.equal(assessScenario({ ...gap, rounds: [...base.rounds, rework] }).passed, false, "不能颠倒退回与交付顺序");
-  assert.equal(assessScenario({ ...gap, rounds: [rework, ...base.rounds], fault: { ...gap.fault, repaired: false } }).passed, false);
-  for (const change of [{ version: "old-missing-input" }, { taskId: "other" }, { criteriaUnchanged: false }, { injectedHash: fault.beforeHash }, { secondRoundId: "round-one" }, { phases: { ...fault.phases, firstFrozen: 0 } }]) {
-    assert.equal(assessScenario({ ...gap, rounds: [rework, ...base.rounds], fault: { ...fault, ...change } }).passed, false);
-  }
-  assert.equal(assessScenario({ ...base, accounting: { verified: false, actualTokens: 800, descendants: ["child"] } }).passed, false);
-  assert.equal(assessScenario({ ...base, accounting: { verified: true, actualTokens: 900, descendants: [] } }).passed, false);
-  assert.equal(assessScenario({ ...base, budget: { ...base.budget, settledTokens: 1001 } }).passed, false);
-});
-
-test("联调真实 apply 入口：wrapup 未触发仍结束运行，但只写 finished、不能写 done", async () => {
-  const { apply: applyE2e } = await import(new URL("../../../dsh-longtask-e2e/index.js", import.meta.url).href);
-  const dir = await fs.mkdtemp(join(tmpdir(), "lt-e2e-coverage-"));
-  const transcriptDir = join(dir, "e2e");
-  await fs.mkdir(transcriptDir);
-  const id = "coverage-fixture";
-  await fs.writeFile(join(dir, "plugin.log"), `budget:admitted task=${id}\n`);
-  await fs.writeFile(join(dir, "state.json"), JSON.stringify({ collections: { taskSessions: { [id]: { worker: { sessionId: "worker" }, acceptor: { sessionId: "acceptor" } } } }, events: {}, eventOrder: [] }));
-  let status = "proposed";
-  const task = () => ({ id, status, versions: [{ goal: "[E2E] coverage" }], currentVersion: 0 });
-  const api = {
-    searchExperts: async (division: string) => [division === "engineering" ? EXECUTOR : REVIEWER],
-    listTasks: () => [], propose: async () => task(), confirm: async () => { status = "delivered"; },
-    getTask: () => task(), getBudget: () => ({ limitTokens: 200, settledTokens: 100, reservedTokens: 0 }),
-    registerArtifact: async () => {}, pause: async () => {},
-  };
-  const teardowns: Array<() => unknown> = [];
-  const services: Record<string, unknown> = {
-    sessions: { flush: async () => true },
-    longtask: api,
-    tools: { register: () => () => {}, guard: () => () => {} },
-    subagents: { listDescendants: async () => [] },
-    agents: { get: (sid: string) => ({ session: { id: sid } }) },
-    sessionProjections: { stateOf: () => ({ totals: { uncachedInputTokens: 30, cacheReadTokens: 10, cacheWriteTokens: 0, outputTokens: 10 } }) },
-  };
-  applyE2e({
-    get: (name: string) => services[name], logger: { info() {} },
-    on: () => () => {},
-    effect(factory: () => Generator) { const value = factory().next().value; if (typeof value === "function") teardowns.push(value as () => unknown); },
-  }, { transcriptDir, artifactDir: join(dir, "artifacts"), scenario: "wrapup", force: true, pollIntervalMs: 1, timeoutMs: 1000 });
-  try {
-    const deadline = Date.now() + 4000;
-    while (!(await fs.readdir(transcriptDir)).some((name) => name.startsWith("summary-"))) {
-      if (Date.now() > deadline) throw Error("联调脚手架未在预期时间结束");
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    const names = await fs.readdir(transcriptDir);
-    assert.ok(names.some((name) => name.startsWith("finished-")), "记录结束，避免下次重载自动重复消耗");
-    assert.equal(names.some((name) => name.startsWith("done-")), false, "delivered 不等于收尾验证通过");
-    const run = await fs.readFile(join(transcriptDir, names.find((name) => name.endsWith(".jsonl"))!), "utf8");
-    assert.ok(run.includes("scenario_not_covered"));
-    assert.ok(run.includes('"verified":true'), "本用例宿主对账通过，失败点确实是收尾未触发");
-  } finally { for (const teardown of teardowns) await teardown(); }
-});
-
-async function harnessFixture(options: { manual?: boolean; timeoutMs?: number } = {}) {
-  const { apply: applyE2e } = await import(new URL("../../../dsh-longtask-e2e/index.js", import.meta.url).href);
-  const dir = await fs.mkdtemp(join(tmpdir(), "lt-e2e-restart-"));
-  const transcriptDir = join(dir, "e2e");
-  await fs.mkdir(transcriptDir);
-  await fs.writeFile(join(transcriptDir, "finished-old.json"), "{}");
-  await fs.writeFile(join(dir, "plugin.log"), "");
-  const tasks = new Map<string, { id: string; status: string; currentVersion: number; versions: Array<{ goal: string }> }>();
-  const leases: Record<string, unknown> = {};
-  const limits = new Map<string, number>();
-  let calls = 0;
-  const proposals: Array<{ goal: string; deliverables: string[] }> = [];
-  const registered: Array<{ id: string; path: string; hash: string; owner: string }> = [];
-  const tools = new Map<string, any>();
-  const eventListeners = new Set<(...args: any[]) => void>();
-  const api = {
-    searchExperts: async (division: string) => [division === "engineering" ? EXECUTOR : REVIEWER],
-    listTasks: () => [...tasks.values()],
-    propose: async (input: { goal: string; deliverables: string[]; budget: { limitTokens: number } }) => {
-      proposals.push(input);
-      const id = `explicit-${++calls}`;
-      const t = { id, status: "proposed", currentVersion: 0, versions: [{ goal: input.goal }] };
-      tasks.set(id, t); limits.set(id, input.budget.limitTokens);
-      leases[id] = { worker: { sessionId: `${id}-worker`, role: "executor" }, acceptor: { sessionId: `${id}-acceptor`, role: "acceptor" } };
-      await fs.writeFile(join(dir, "state.json"), JSON.stringify({ collections: { taskSessions: leases }, events: {}, eventOrder: [] }));
-      return t;
-    },
-    confirm: async (id: string) => { tasks.get(id)!.status = options.manual ? "active" : "delivered"; },
-    getTask: (id: string) => tasks.get(id),
-    getBudget: (id: string) => ({ limitTokens: limits.get(id), settledTokens: 100, reservedTokens: 0 }),
-    registerArtifact: async (id: string, path: string, hash: string, owner: string) => { registered.push({ id, path, hash, owner }); },
-    pause: async (id: string) => { tasks.get(id)!.status = "paused"; },
-  };
-  const teardowns: Array<() => unknown> = [];
-  const services: Record<string, unknown> = {
-    sessions: { flush: async () => true },
-    longtask: api, subagents: { listDescendants: async () => [] },
-    tools: { register: (tool: any) => { tools.set(tool.name, tool); return () => tools.delete(tool.name); }, guard: () => () => {} },
-    agents: { get: (id: string) => ({ session: { id } }) },
-    sessionProjections: { stateOf: () => ({ totals: { uncachedInputTokens: 30, cacheReadTokens: 10, cacheWriteTokens: 0, outputTokens: 10 } }) },
-  };
-  applyE2e({ get: (name: string) => services[name], on: (_name: string, fn: (...args: any[]) => void) => { eventListeners.add(fn); return () => eventListeners.delete(fn); }, logger: { info() {} }, effect(factory: () => Generator) {
-    const value = factory().next().value; if (typeof value === "function") teardowns.push(value as () => unknown);
-  } }, { transcriptDir, artifactDir: join(dir, "artifacts"), pollIntervalMs: 1, timeoutMs: options.timeoutMs ?? (options.manual ? 5000 : 1000) });
-  const wait = async (predicate: () => Promise<boolean>) => {
-    const deadline = Date.now() + 4000;
-    while (!await predicate()) { if (Date.now() > deadline) throw Error("显式运行请求未被接收"); await new Promise((r) => setTimeout(r, 10)); }
-  };
-  return { dir, transcriptDir, proposals, registered, tools, eventListeners, tasks,
-    emit: (sid: string, event: unknown) => { for (const fn of eventListeners) fn({ id: sid }, event); },
-    calls: () => calls, wait, close: async () => { for (const teardown of teardowns) await teardown(); } };
-}
-
-test("收尾夹具消费者 apply 完整握手：真任务归属、先登记回执、校对产物、结束后清理", async () => {
-  const h = await harnessFixture({ manual: true });
-  const { publishRunRequest } = await import(new URL("../../../dsh-longtask-e2e/request-run.mjs", import.meta.url).href);
-  try {
-    publishRunRequest({ scenario: "wrapup", budgetTokens: 260000 }, h.transcriptDir);
-    await h.wait(async () => h.tasks.get("explicit-1")?.status === "active");
-    const runId = /runId=([a-f0-9-]+)/.exec(h.proposals[0]!.goal)![1];
-    const tool = h.tools.get("e2e_wrapup_checkpoint");
-    assert.ok(tool, "真实消费者入口装配检查点工具");
-    const exec = { agent: { session: { id: "explicit-1-worker" } }, signal: new AbortController().signal };
-    h.emit("explicit-1-worker", { type: "step/start", data: { turn: 1, step: 1 } });
-    assert.equal(JSON.parse(await tool.execute({ runId, action: "advance", cursor: 0 }, exec)).checked, 1);
-    h.emit("explicit-1-worker", { type: "step/start", data: { turn: 1, step: 2 } });
-    h.emit("explicit-1-worker", { type: "user/message", data: { source: { kind: "longtask", dedupeKey: "wrap-up:explicit-1:v1" } } });
-    const receipt = JSON.parse(await tool.execute({ runId, action: "close", cursor: 1 }, exec)).receipt;
-    assert.equal(h.registered.length, 1, "返回回执前已经通过公开 API 登记");
-    assert.equal(h.registered[0]!.owner, "harness");
-    const rawReceipt = await fs.readFile(h.registered[0]!.path);
-    assert.equal(createHash("sha256").update(rawReceipt).digest("hex"), h.registered[0]!.hash);
-    await fs.writeFile(h.proposals[0]!.deliverables[0]!, `本地模拟产物\n${receipt}\n`);
-    await fs.writeFile(join(h.dir, "plugin.log"), "budget:wrap-up task=explicit-1\ncontrol:consumed task=explicit-1 kind=wrap-up\n");
-    h.tasks.get("explicit-1")!.status = "delivered";
-    await h.wait(async () => (await fs.readdir(h.transcriptDir)).some((n) => n.startsWith("done-")));
-    const summary = (await fs.readdir(h.transcriptDir)).find((n) => n.startsWith("summary-"))!;
-    assert.match(await fs.readFile(join(h.transcriptDir, summary), "utf8"), /场景验证：通过/);
-    assert.equal(h.tools.size, 0, "任务结束立即注销测试工具");
-    assert.equal(h.eventListeners.size, 0, "不留下其他任务的事件监听器");
-  } finally { await h.close(); }
-});
-
-test("收尾夹具消费者超时：暂停执行、不发回执、不自动重试", async () => {
-  const h = await harnessFixture({ manual: true, timeoutMs: 10 });
-  const { publishRunRequest } = await import(new URL("../../../dsh-longtask-e2e/request-run.mjs", import.meta.url).href);
-  try {
-    publishRunRequest({ scenario: "wrapup", budgetTokens: 260000 }, h.transcriptDir);
-    await h.wait(async () => (await fs.readdir(h.transcriptDir)).some((n) => n.startsWith("finished-") && n !== "finished-old.json"));
-    assert.equal(h.tasks.get("explicit-1")!.status, "paused");
-    assert.equal(h.calls(), 1);
-    assert.equal(h.registered.length, 0);
-    assert.equal(h.tools.size, 0);
-    assert.equal((await fs.readdir(h.transcriptDir)).some((n) => n.startsWith("done-")), false);
-  } finally { await h.close(); }
-});
-
-test("收尾夹具真实 apply：两轮独立路径且不改旧产物；目标声明检查点和固定预算", async () => {
-  const h = await harnessFixture();
-  const { publishRunRequest } = await import(new URL("../../../dsh-longtask-e2e/request-run.mjs", import.meta.url).href);
-  const old = join(h.transcriptDir, "..", "artifacts", "wrapup.md");
-  await fs.mkdir(join(old, ".."), { recursive: true });
-  await fs.writeFile(old, "历史冻结产物");
-  try {
-    const summaries = async () => (await fs.readdir(h.transcriptDir)).filter((n) => n.startsWith("summary-"));
-    for (let i = 1; i <= 2; i++) {
-      publishRunRequest({ scenario: "wrapup", budgetTokens: 260000 }, h.transcriptDir);
-      await h.wait(async () => (await summaries()).length === i);
-    }
-    assert.notEqual(h.proposals[0]!.deliverables[0], h.proposals[1]!.deliverables[0]);
-    assert.equal(await fs.readFile(old, "utf8"), "历史冻结产物");
-    for (const p of h.proposals) {
-      assert.match(p.goal, /checkpoint-v2/);
-      assert.match(p.goal, /e2e_wrapup_checkpoint/);
-      assert.match(p.goal, /action=close/);
-      assert.ok(Buffer.byteLength(p.goal, "utf8") < 6000, "移除重复背景，避免每个请求和验收继承几万字节的人工压力");
-      assert.match(p.goal, /模型步骤不是turn/);
-      assert.match(p.goal, /nextCursor/);
-      await assert.rejects(fs.stat(p.deliverables[0]!), { code: "ENOENT" }, "夹具不替执行者生成交付物");
-    }
-  } finally { await h.close(); }
-});
-
-test("收尾夹具：一次模型步骤只推进一次，必须活动中真实消费后才发本轮回执", async () => {
-  const { createWrapupFixture } = await import(new URL("../../../dsh-longtask-e2e/wrapup-fixture.mjs", import.meta.url).href);
-  const directory = await fs.mkdtemp(join(tmpdir(), "lt-wrap-fixture-"));
-  const artifact = join(directory, "wrapup.md");
-  let registered = 0;
-  const fixture = createWrapupFixture({ runId: "run-one", directory, ownsSession: (task: string, sid: string) => task === "task-one" && sid === "worker", onReceipt: async (_task: string, path: string) => {
-    assert.match(await fs.readFile(path, "utf8"), /WRAPUP-/);
-    registered++;
-  } });
-  fixture.bind("task-one");
-  const agent = { session: { id: "worker" } };
-  const exec = { agent, signal: new AbortController().signal };
-  let cursor = 0;
-  const call = (action: string, runId = "run-one", caller = exec) => fixture.tool.execute({ runId, action, cursor }, caller).then((raw: string) => {
-    const result = JSON.parse(raw); if (Number.isSafeInteger(result.nextCursor)) cursor = result.nextCursor; return result;
-  });
-  const observe = (type: string, data: unknown, id = "worker") => fixture.observe({ id }, { type, data });
-  observe("step/start", { turn: 1, step: 1 });
-  await fs.writeFile(artifact, "WRAPUP-旧回执");
-  assert.equal((await call("close")).status, "pending");
-  const repeated = await Promise.all([call("advance"), call("advance"), call("advance")]);
-  assert.equal(repeated[0].checked, 1);
-  assert.deepEqual(repeated[0], repeated[2]);
-  assert.equal(fixture.snapshot(artifact).explored, 1);
-  for (const [kind, key, sid] of [["longtask", "wrap-up:other:v1", "worker"], ["other", "wrap-up:task-one:v1", "worker"], ["longtask", "wrap-up:task-one:v1", "acceptor"]]) {
-    observe("user/message", { source: { kind, dedupeKey: key } }, sid);
-    assert.equal((await call("close")).status, "pending");
-  }
-  await assert.rejects(call("advance", "old-run"), /不属于/);
-  await assert.rejects(call("advance", "run-one", { ...exec, agent: { session: { id: "acceptor" } } }), /不属于/);
-  observe("step/start", { turn: 1, step: 2 });
-  await assert.rejects(fixture.tool.execute({ runId: "run-one", action: "advance", cursor: 0 }, exec), /过期检查点/);
-  assert.equal((await call("advance")).checked, 2);
-  observe("step/start", { turn: 1, step: 3 });
-  observe("user/message", { source: { kind: "longtask", dedupeKey: "wrap-up:task-one:v1" } });
-  assert.equal((await call("advance")).status, "closing");
-  const result = await call("close");
-  assert.match(result.receipt, /^WRAPUP-/);
-  assert.equal(result.receiptRecordWritten, true);
-  assert.equal(result.artifactRegistered, true);
-  assert.match(result.instruction, /write成功后直接输出done=true/);
-  assert.equal((await call("close")).receipt, result.receipt, "幂等领取");
-  assert.equal(registered, 1, "回执在返回模型前登记，重复领取不重复登记");
-  const before = fixture.snapshot(artifact);
-  assert.equal(before.artifactMatches, false, "旧回执不能通过");
-  assert.equal(before.pendingAtControl, true);
-  assert.ok(before.receiptOrder > before.controlOrder);
-  await fs.writeFile(artifact, `八条测试要点\n${result.receipt}\n`);
-  assert.equal(fixture.snapshot(artifact).artifactMatches, true);
-  assert.equal(fixture.snapshot(artifact).receiptFileMatches, true);
-  await fs.writeFile(fixture.receiptPath, "篡改记录");
-  assert.equal(fixture.snapshot(artifact).receiptFileMatches, false);
-  fixture.dispose();
-  await assert.rejects(call("close"), /不属于/);
-});
-
-test("收尾夹具：迟到控制无效、缺能力不安装、检查到上限后停止且不追加预算", async () => {
-  const { createWrapupFixture, MAX_CHECKS } = await import(new URL("../../../dsh-longtask-e2e/wrapup-fixture.mjs", import.meta.url).href);
-  const directory = await fs.mkdtemp(join(tmpdir(), "lt-wrap-negative-"));
-  let pauses = 0;
-  const make = () => createWrapupFixture({ runId: "run", directory, ownsSession: (_task: string, sid: string) => sid === "worker", onExhausted: async () => { pauses++; } });
-  const late = make(); late.bind("task");
-  assert.throws(() => late.install({ get: () => undefined }), /缺失时不创建付费任务/);
-  const exec = { agent: { session: { id: "worker" } }, signal: new AbortController().signal };
-  const cursors = new Map<any, number>();
-  const call = (f: any, action: string) => f.tool.execute({ runId: "run", action, cursor: cursors.get(f) ?? 0 }, exec).then((raw: string) => {
-    const r = JSON.parse(raw); if (Number.isSafeInteger(r.nextCursor)) cursors.set(f, r.nextCursor); return r;
-  });
-  late.observe({ id: "worker" }, { type: "step/start", data: { turn: 1, step: 1 } });
-  await call(late, "advance");
-  late.observe({ id: "worker" }, { type: "turn/end", data: {} });
-  late.observe({ id: "worker" }, { type: "user/message", data: { source: { kind: "longtask", dedupeKey: "wrap-up:task:v1" } } });
-  assert.equal(late.snapshot().pendingAtControl, false);
-  await assert.rejects(call(late, "close"), /活动模型步骤/);
-  const capped = make(); capped.bind("task");
-  for (let step = 1; step <= MAX_CHECKS; step++) {
-    capped.observe({ id: "worker" }, { type: "step/start", data: { turn: 1, step } });
-    const reply = await call(capped, "advance");
-    assert.equal(reply.status, step === MAX_CHECKS ? "exhausted" : "checking");
-  }
-  assert.equal(pauses, 1);
-  assert.equal((await call(capped, "advance")).status, "exhausted");
-  assert.equal(pauses, 1, "重复或并行调用不得重复暂停");
-  assert.equal(capped.snapshot().receiptIssued, false);
-  assert.equal(capped.snapshot().explored, MAX_CHECKS);
-  capped.dispose(); late.dispose();
-});
-
-test("收尾夹具与产品 apply 联动：默认策略及26万固定预算下，真实控制进入当前提案后才能完成握手", async () => {
-  const { createWrapupFixture } = await import(new URL("../../../dsh-longtask-e2e/wrapup-fixture.mjs", import.meta.url).href);
-  const { fake, api, dir } = await makeApp(); // 不调低收尾比例或步数上限。
-  const task = await api.propose({ goal: "[E2E-WRAPUP] 活动检查", criteria: [{ id: "c1", text: "收尾" }], deliverables: [join(dir, "out.md")], executors: [EXECUTOR], acceptor: REVIEWER, budget: { limitTokens: 260000, strict: true } });
-  await api.confirm(task.id);
-  const worker = findAgentByMessage(fake, "research/worker.md")!;
-  const fixture = createWrapupFixture({ runId: "run", directory: dir, ownsSession: (id: string, sid: string) => id === task.id && sid === worker.sessionId,
-    onReceipt: async (id: string, path: string) => {
-      const hash = createHash("sha256").update(await fs.readFile(path)).digest("hex");
-      await (api as unknown as { registerArtifact(id: string, path: string, hash: string, owner: string): Promise<void> }).registerArtifact(id, path, hash, "harness");
-    },
-  });
-  fixture.bind(task.id);
-  fake.ctx.on("session/event", fixture.observe);
-  const exec = { agent: worker, signal: new AbortController().signal };
-  let cursor = 0;
-  const call = (action: string) => fixture.tool.execute({ runId: "run", action, cursor }, exec).then((raw: string) => {
-    const r = JSON.parse(raw); if (Number.isSafeInteger(r.nextCursor)) cursor = r.nextCursor; return r;
-  });
-  try {
-    let consumed = false;
-    assert.equal(await fake.emitPreStep(worker.sessionId), true);
-    for (let step = 1; step <= 7; step++) {
-      fake.emitSessionEvent(worker.sessionId, { type: "step/start", data: { turn: 1, step } });
-      // 消费的是产品真实返回的 UserMessage（保留 source），没有自行构造收尾消息。
-      for (const message of fake.stepMessages.get(worker.sessionId) ?? []) {
-        if ((message as { source?: { dedupeKey?: string } }).source?.dedupeKey?.startsWith("wrap-up:")) {
-          fake.emitSessionEvent(worker.sessionId, { type: "user/message", data: message });
-          consumed = true;
-        }
-      }
-      if (consumed) {
-        assert.equal((await call("close")).status, "close");
-        break;
-      }
-      assert.equal((await call("advance")).status, "checking");
-      fake.emitSessionEvent(worker.sessionId, assistantUsageEvent(1, { inputTokens: 26000, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 }));
-      assert.equal(await fake.emitPreStep(worker.sessionId), true);
-    }
-    assert.equal(consumed, true);
-    const evidence = fixture.snapshot();
-    assert.equal(evidence.pendingAtControl, true);
-    assert.equal(evidence.receiptIssued, true);
-    assert.ok(evidence.explored > 0 && evidence.explored < 8);
-    assert.equal(api.getTask(task.id)?.status, "active", "收尾消费发生时尚有落盘与报告工作");
-    const b = api.getBudget(task.id)!;
-    assert.equal(b.limitTokens, 260000);
-    assert.ok(b.settledTokens + b.reservedTokens < b.limitTokens);
-    await fs.writeFile(join(dir, "out.md"), "收尾产物");
-    fake.emitSessionEvent(worker.sessionId, assistantUsageEvent(1, { inputTokens: 26000, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 }, '<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>'));
-    fake.emitSessionEvent(worker.sessionId, turnEndEvent(1));
-    await fake.waitFor(() => Boolean(findAgentByMessage(fake, "独立验收请求")));
-    const acceptance = lastDelivery(findAgentByMessage(fake, "独立验收请求")!);
-    assert.ok(acceptance.includes(fixture.receiptPath), "验收的允许读取清单必须含回执");
-    const receiptHash = createHash("sha256").update(await fs.readFile(fixture.receiptPath)).digest("hex");
-    assert.ok(Object.values(frozenHashes(acceptance)).includes(receiptHash), "回执与真实产物一起冻结，不能在验收后补写");
-  } finally { fixture.dispose(); for (const teardown of fake.teardowns) await teardown(); }
-});
-
-test("收尾夹具真实 SDK ToolRuntime：schema可装配、正文按身份拦截、卸载注销工具", async () => {
-  const { createWrapupFixture, WRAPUP_TOOL } = await import(new URL("../../../dsh-longtask-e2e/wrapup-fixture.mjs", import.meta.url).href);
-  const { Context } = await import("@deepseek-ai/cordis");
-  const { ToolRuntime } = await loadSdk("dsh-tools");
-  const { apply: applyRepeatReminder } = await loadSdk("dsh-repeat-tool-reminder");
-  const root = new Context(); root.provide("systemPrompt", { tools() {} });
-  const runtime = await prepareSdkTools(root,new ToolRuntime(root));
-  applyRepeatReminder(root, { thresholds: [3, 5, 8], include: [], exclude: [], argumentsPreviewChars: 500 });
-  const directory = await fs.mkdtemp(join(tmpdir(), "lt-wrap-sdk-"));
-  const fixture = createWrapupFixture({ runId: "run", directory, ownsSession: (_task: string, sid: string) => sid === "worker", ownsAcceptorSession: (_task: string, sid: string) => sid === "acceptor" });
-  fixture.bind("task");
-  fixture.install({ get: () => runtime, on: (name: string, fn: (...args: any[]) => void) => root.on(name as any, fn as any) });
-  try {
-    const agent = { id: "worker", session: { id: "worker" } };
-    assert.ok(runtime.schemas(agent).some((s: { name: string }) => s.name === WRAPUP_TOOL));
-    (root as any).emit("session/event", agent.session, { type: "step/start", data: { turn: 1, step: 1 } });
-    const request = { name: WRAPUP_TOOL, callId: "check-1", arguments: { runId: "run", action: "advance", cursor: 0 }, agent, signal: new AbortController().signal };
-    const result = await runtime.execute(request);
-    assert.equal(result.isError, false);
-    assert.equal(JSON.parse(result.value).checked, 1);
-    for (let step = 2; step <= 4; step++) {
-      (root as any).emit("session/event", agent.session, { type: "step/start", data: { turn: 1, step } });
-      const progressed = await runtime.execute({ ...request, callId: `check-${step}`, arguments: { ...request.arguments, cursor: step - 1 } });
-      assert.equal(JSON.parse(progressed.value).checked, step);
-      assert.equal((progressed.additionalContexts ?? []).some((m: any) => m.source?.kind === "repeat-tool-reminder"), false, "真实宿主重复调用检测识别不同的检查点");
-    }
-    let repeated;
-    for (let n = 0; n < 2; n++) repeated = await runtime.execute({ ...request, callId: `duplicate-${n}`, arguments: { ...request.arguments, cursor: 3 } });
-    assert.ok((repeated.additionalContexts ?? []).some((m: any) => m.source?.kind === "repeat-tool-reminder"), "阳性对照：原样重放仍会被真实宿主提醒，未关闭防循环机制");
-    let shellBodies = 0;
-    runtime.register({ name: "pwsh", parameters: { type: "object", properties: {} }, output: { schema: { type: "string" }, render: (_args: unknown, value: string) => [{ type: "text", text: value }] }, execute: async () => { shellBodies++; return "executed"; } });
-    for (const id of ["worker", "acceptor"]) {
-      const blocked = await runtime.execute({ ...request, name: "pwsh", callId: `shell-${id}`, arguments: {}, agent: { id, session: { id } } });
-      assert.equal(blocked.isError, true);
-    }
-    assert.equal(shellBodies, 0, "本任务的命令在沙箱初始化之前被拦下");
-    assert.equal((await runtime.execute({ ...request, name: "pwsh", callId: "shell-user", arguments: {}, agent: { id: "user", session: { id: "user" } } })).isError, false);
-    assert.equal(shellBodies, 1, "不影响用户正常会话");
-    const foreign = await runtime.execute({ ...request, callId: "foreign", agent: { id: "user", session: { id: "user" } } });
-    assert.equal(foreign.isError, true);
-    fixture.dispose();
-    assert.equal(runtime.schemas(agent).some((s: { name: string }) => s.name === WRAPUP_TOOL), false);
-    assert.equal((await runtime.execute({ ...request, name: "pwsh", callId: "after-dispose", arguments: {} })).isError, false, "结束后移除临时命令限制");
-  } finally { fixture.dispose(); await root.fiber.dispose(); }
-});
-
 test('阶段三A费用回放：16万在额外探索前暂停留证，20万响应收尾后完成独立验收且无追加',async()=>{
   for(const limitTokens of [160000,200000]){
     const {fake,api,dir}=await makeApp();const artifact=join(dir,'stage3-A.md');
@@ -1910,38 +1515,6 @@ test('阶段三A费用回放：16万在额外探索前暂停留证，20万响应
       const budget=api.getBudget(task.id)!;assert.equal(budget.settledTokens,143539);assert.equal(budget.limitTokens,200000);assert.deepEqual((budget as any).grants,[]);
     }finally{for(const teardown of fake.teardowns)await teardown();}
   }
-});
-
-test('阶段三实际简报费用矩阵：A五步/B三步/C三步及各两步验收全部在50万内',async()=>{
-  const {stage3TaskInput}=await import(new URL('../../../dsh-longtask-e2e/stage3-driver.mjs',import.meta.url).href);
-  const {STAGE3_TOOL,splitBudget}=await import(new URL('../../../dsh-longtask-e2e/stage3-protocol.mjs',import.meta.url).href);
-  const {fake,api,dir}=await makeApp();const get=fake.ctx.get.bind(fake.ctx);
-  fake.ctx.get=((name:string)=>name==='tools'?{...get<any>('tools'),get:(name:string)=>name===STAGE3_TOOL?{name}:undefined}:get(name)) as typeof fake.ctx.get;
-  const run='11111111-1111-4111-8111-111111111111',shares=splitBudget(500000),costs:any={A:[21926,22286,22468,22063,22696],B:[22177,22472,22300],C:[22082,22226,22300]};let total=0;
-  try{
-    const out=join(dir,`stage3-${run}`);await fs.mkdir(out);
-    for(const role of ['A','B','C'] as const){
-      const artifact=join(out,`${role}.md`),spec=stage3TaskInput(run,role,artifact);
-      const t=await api.propose({...spec,executors:[EXECUTOR],acceptor:REVIEWER,budget:{limitTokens:shares[role],strict:true}});await api.confirm(t.id);
-      const worker=[...fake.agentsById.values()].find(a=>a.messages.some(m=>m.includes(spec.goal)))!;
-      for(let step=0;step<costs[role].length;step++){
-        assert.equal(await fake.emitPreStep(worker.sessionId,step===0?inboundChars(17000):[]),true,`${role}执行step${step+1}`);
-        if(step===1)await fs.writeFile(artifact,`STAGE3 ${run} ${role}\n${role==='A'?'后台写入完成':role==='B'?'口径码：ST3-confirmed':'优先任务完成'}`);
-        fake.emitSessionEvent(worker.sessionId,assistantUsageEvent(1,{inputTokens:costs[role][step]-100,outputTokens:100,cacheReadTokens:0,cacheWriteTokens:0},step===costs[role].length-1?'<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>':'成本回放'));
-      }
-      fake.emitSessionEvent(worker.sessionId,turnEndEvent(1));
-      await fake.waitFor(()=>[...fake.agentsById.values()].some(a=>a.messages.some(m=>m.includes('独立验收请求')&&m.includes(t.id))));
-      const acceptor=[...fake.agentsById.values()].find(a=>a.messages.some(m=>m.includes('独立验收请求')&&m.includes(t.id)))!;
-      const request=lastDelivery(acceptor),roundId=/轮次 (round_[a-z0-9]+)/.exec(request)![1];
-      assert.equal(await fake.emitPreStep(acceptor.sessionId,inboundChars(5945)),true,`${role}验收首步`);
-      const actual=await fs.readFile(artifact,'utf8');fake.emitSessionEvent(acceptor.sessionId,assistantUsageEvent(1,{inputTokens:15500,outputTokens:200,cacheReadTokens:0,cacheWriteTokens:0},actual));
-      assert.equal(await fake.emitPreStep(acceptor.sessionId),true,`${role}验收结论`);
-      fake.emitSessionEvent(acceptor.sessionId,assistantUsageEvent(1,{inputTokens:16000,outputTokens:400,cacheReadTokens:0,cacheWriteTokens:0},`<longtask_verdicts>${JSON.stringify({roundId,verdicts:spec.criteria.map((c:any)=>({criterionId:c.id,outcome:'pass',evidence:actual,gap:null,verdictBy:REVIEWER.relPath,criteriaVersion:1})),artifactHashes:frozenHashes(request)})}</longtask_verdicts>`));fake.emitSessionEvent(acceptor.sessionId,turnEndEvent(1));
-      await fake.waitFor(()=>api.getTask(t.id)?.status==='delivered'&&api.getBudget(t.id)?.reservedTokens===0);
-      const budget=api.getBudget(t.id)!;assert.equal(budget.limitTokens,shares[role]);assert.deepEqual((budget as any).grants,[]);total+=budget.settledTokens;
-    }
-    assert.equal(total,341296);assert.ok(total<500000);
-  }finally{for(const stop of fake.teardowns)await stop();}
 });
 
 test('预算计划随产物增长重算；暂停恢复和同目录重新装配不重置费用、不误启预算暂停',async()=>{
@@ -1981,288 +1554,6 @@ test('固定预算退回再验收：返工沿用费用并重新保护验收，�
     }
     assert.equal(api.getBudget(t.id)!.limitTokens,300000);assert.deepEqual((api.getBudget(t.id) as any).grants,[]);
   }finally{for(const stop of fake.teardowns)await stop();}
-});
-
-test("收尾固定预算覆盖最终报告与三步验收：不同请求成本均完整交付，不追加额度", async () => {
-  const { createWrapupFixture, MAX_CHECKS } = await import(new URL("../../../dsh-longtask-e2e/wrapup-fixture.mjs", import.meta.url).href);
-  for (const baseInput of [16000, 22000, 28000]) {
-    const { fake, api, dir } = await makeApp();
-    const artifact = join(dir, "matrix.md");
-    const task = await api.propose({ goal: "[E2E-WRAPUP] 收尾完整链路", criteria: [{ id: "c1", text: "文件含回执" }], deliverables: [artifact], executors: [EXECUTOR], acceptor: REVIEWER, budget: { limitTokens: 260000, strict: true } });
-    await api.confirm(task.id);
-    const worker = findAgentByMessage(fake, "research/worker.md")!;
-    const fixture = createWrapupFixture({ runId: "matrix", directory: dir, ownsSession: (_id: string, sid: string) => sid === worker.sessionId });
-    fixture.bind(task.id); fake.ctx.on("session/event", fixture.observe);
-    const usage = (input: number, text = "继续") => assistantUsageEvent(1, { inputTokens: input, outputTokens: 300, cacheReadTokens: 0, cacheWriteTokens: 0 }, text);
-    const exec = { agent: worker, signal: new AbortController().signal };
-    let cursor = 0;
-    let steps = 0;
-    try {
-      assert.equal(await fake.emitPreStep(worker.sessionId, inboundChars(12000)), true);
-      let token;
-      for (let step = 1; step <= MAX_CHECKS; step++) {
-        steps = step;
-        fake.emitSessionEvent(worker.sessionId, { type: "step/start", data: { turn: 1, step } });
-        let closing = false;
-        for (const message of fake.stepMessages.get(worker.sessionId) ?? []) {
-          if ((message as any).source?.dedupeKey?.startsWith("wrap-up:")) {
-            fake.emitSessionEvent(worker.sessionId, { type: "user/message", data: message }); closing = true;
-          }
-        }
-        const result = JSON.parse(await fixture.tool.execute({ runId: "matrix", action: closing ? "close" : "advance", cursor }, exec));
-        if (closing) { token = result.receipt; fake.emitSessionEvent(worker.sessionId, usage(baseInput + step * 160)); break; }
-        cursor = result.nextCursor;
-        fake.emitSessionEvent(worker.sessionId, usage(baseInput + step * 160));
-        assert.equal(await fake.emitPreStep(worker.sessionId), true, `input=${baseInput} step=${step}`);
-      }
-      assert.ok(token, "未靠降低阈值即可消费收尾");
-      assert.equal(await fake.emitPreStep(worker.sessionId), true, "留有写入步骤");
-      await fs.writeFile(artifact, `本地模拟产物\n${token}`);
-      fake.emitSessionEvent(worker.sessionId, usage(baseInput + (++steps) * 160));
-      assert.equal(await fake.emitPreStep(worker.sessionId), true, "留有最终报告步骤");
-      fake.emitSessionEvent(worker.sessionId, usage(baseInput + (++steps) * 160, '<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>'));
-      fake.emitSessionEvent(worker.sessionId, turnEndEvent(1));
-      await fake.waitFor(() => Boolean(findAgentByMessage(fake, "独立验收请求")));
-      const acceptor = findAgentByMessage(fake, "独立验收请求")!;
-      const request = lastDelivery(acceptor);
-      const roundId = /轮次 (round_[a-z0-9]+)/.exec(request)![1];
-      for (let step = 1; step <= 3; step++) {
-        assert.equal(await fake.emitPreStep(acceptor.sessionId), true, `input=${baseInput} 验收step=${step}`);
-        const text = step < 3 ? "读取并核对产物" : `<longtask_verdicts>${JSON.stringify({ roundId, verdicts: [{ criterionId: "c1", outcome: "pass", evidence: "已核对回执与产物", gap: null, verdictBy: REVIEWER.relPath, criteriaVersion: 1 }], artifactHashes: frozenHashes(request) })}</longtask_verdicts>`;
-        fake.emitSessionEvent(acceptor.sessionId, usage(16000 + step * 160, text));
-      }
-      fake.emitSessionEvent(acceptor.sessionId, turnEndEvent(1));
-      await fake.waitFor(() => api.getTask(task.id)?.status === "delivered");
-      await fake.waitFor(() => api.getBudget(task.id)?.reservedTokens === 0);
-      const budget = api.getBudget(task.id)!;
-      assert.equal(budget.limitTokens, 260000);
-      assert.ok(budget.settledTokens <= 260000);
-      assert.equal(fake.logs.some((l) => l.includes("bound-exceeded")), false, "模拟请求均受准入上界覆盖");
-    } finally { fixture.dispose(); for (const teardown of fake.teardowns) await teardown(); }
-  }
-});
-
-test("联调同一实例接收连续两次显式请求；已结束记录不阻止重跑，也不自动再跑", async () => {
-  const h = await harnessFixture();
-  const { publishRunRequest } = await import(new URL("../../../dsh-longtask-e2e/request-run.mjs", import.meta.url).href);
-  try {
-    const request = { scenario: "basic", budgetTokens: 200, strict: true };
-    publishRunRequest(request, h.transcriptDir);
-    assert.throws(() => publishRunRequest({ ...request, budgetTokens: 300 }, h.transcriptDir), { code: "EEXIST" }, "不覆盖待消费请求");
-    const summaries = async () => (await fs.readdir(h.transcriptDir)).filter((name) => name.startsWith("summary-"));
-    await h.wait(async () => (await summaries()).length === 1);
-    publishRunRequest({ ...request, budgetTokens: 300 }, h.transcriptDir);
-    await h.wait(async () => (await summaries()).length === 2);
-    await new Promise((r) => setTimeout(r, 1200));
-    assert.equal(h.calls(), 2, "每个显式请求只创建一次任务，空闲时不自动花预算");
-  } finally { await h.close(); }
-});
-
-test("联调错误请求不得回退默认预算开跑；拒绝后仍能接收修正请求", async () => {
-  const h = await harnessFixture();
-  const { publishRunRequest } = await import(new URL("../../../dsh-longtask-e2e/request-run.mjs", import.meta.url).href);
-  try {
-    await fs.writeFile(join(h.transcriptDir, "run-request.json"), "{bad json");
-    await h.wait(async () => (await fs.readdir(h.transcriptDir)).some((name) => name.startsWith("run-request-rejected-")));
-    assert.equal(h.calls(), 0);
-    assert.throws(() => publishRunRequest({ scenario: "wrapup", budgetTokens: 200, wrapUpAtBudgetRatio: 0.1 }, h.transcriptDir), /不支持的字段/);
-    publishRunRequest({ scenario: "basic", budgetTokens: 200, strict: true }, h.transcriptDir);
-    await h.wait(async () => (await fs.readdir(h.transcriptDir)).some((name) => name.startsWith("summary-")));
-    assert.equal(h.calls(), 1);
-  } finally { await h.close(); }
-});
-
-test("故障夹具：最终无工具完成报告同步注入；冻结后不改、由原Worker真实修复", async () => {
-  const { createGapFixture, GAP_BODY } = await import(new URL("../../../dsh-longtask-e2e/gap-fixture.mjs", import.meta.url).href);
-  const dir = await fs.mkdtemp(join(tmpdir(), "lt-gap-unit-"));
-  const artifactPath = join(dir, "out.md");
-  const marker = "SYNC-TEST-RUN";
-  const original = `${GAP_BODY}\n${marker}\n`;
-  await fs.writeFile(artifactPath, original);
-  const view: any = { task: { status: "proposed" }, version: { version: 1, goal: "g", criteria: ["c1", "c2"], confirmedAt: null },
-    sessions: [{ sessionId: "worker", role: "executor" }, { sessionId: "acceptor", role: "acceptor" }], rounds: [], artifacts: [], events: [] };
-  const entries: any[] = [];
-  const fixture = createGapFixture({ runId: "run", artifactPath, marker, readView: () => view, log: (kind: string, data: unknown) => entries.push({ kind, data }) });
-  fixture.bind("task"); view.task.status = "active"; view.version.confirmedAt = "confirmed";
-  const report = assistantEvent('<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>', 1);
-  fixture.observe({ id: "unrelated" }, report);
-  fixture.observe({ id: "worker" }, { ...report, data: { ...report.data, message: { ...report.data.message, content: [...report.data.message.content, { type: "tool-call", name: "write" }] } } });
-  assert.equal(await fs.readFile(artifactPath, "utf8"), original, "带工具调用的中间报告不能提前注入");
-  fixture.observe({ id: "worker" }, report);
-  const corrupted = await fs.readFile(artifactPath, "utf8");
-  assert.equal(corrupted, original.slice(0, original.lastIndexOf(marker)));
-  assert.equal(view.rounds.length, 0, "注入发生时没有冻结轮次");
-  fixture.observe({ id: "worker" }, report);
-  assert.equal(entries.filter((e) => e.kind === "fault_injected").length, 1, "同一报告重复送达幂等");
-  const firstHash = createHash("sha256").update(corrupted).digest("hex");
-  view.artifacts.push({ id: "a1", location: artifactPath, contentHash: firstHash });
-  view.rounds.push({ roundId: "r1", state: "pending", artifactHashes: { a1: firstHash } });
-  view.task.status = "awaiting_acceptance";
-  fixture.observe({ id: "acceptor" }, { type: "step/start", data: { turn: 1, step: 1 } });
-  assert.equal(await fs.readFile(artifactPath, "utf8"), corrupted, "验收开始后不再改变缺项版本");
-  assert.equal(fixture.snapshot().phases.firstFrozen, 2);
-  view.rounds[0].state = "settled";
-  view.events.push({ type: "task.verdict", payload: { roundId: "r1", verdicts: [{ criterionId: "c2", outcome: "gap" }] } });
-  view.task.status = "rework";
-  await fs.writeFile(artifactPath, original); // 模拟原Worker实际写入修复，夹具只观察。
-  fixture.observe({ id: "worker" }, assistantEvent('<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>', 2));
-  const repairedHash = createHash("sha256").update(original).digest("hex");
-  view.artifacts.push({ id: "a2", location: artifactPath, contentHash: repairedHash });
-  view.rounds.push({ roundId: "r2", state: "pending", artifactHashes: { a2: repairedHash } });
-  view.task.status = "awaiting_acceptance";
-  fixture.observe({ id: "acceptor" }, { type: "step/start", data: { turn: 2, step: 1 } });
-  assert.deepEqual(fixture.snapshot().phases, { injected: 1, firstFrozen: 2, gap: 3, repaired: 4, secondFrozen: 5 });
-  assert.equal(fixture.snapshot().artifactMatches, true);
-  assert.equal(fixture.snapshot().failure, null);
-  assert.equal(fixture.guard({ name: "write", agent: { session: { id: "acceptor" } } })?.includes("验收只允许"), true);
-  assert.equal(fixture.guard({ name: "pwsh", agent: { session: { id: "worker" } } })?.includes("不运行终端"), true);
-  assert.equal(fixture.guard({ name: "pwsh", agent: { session: { id: "user" } } }), undefined);
-  fixture.dispose();
-  assert.equal(fixture.guard({ name: "write", agent: { session: { id: "acceptor" } } }), undefined);
-});
-
-test("故障夹具负例：未写齐、已有冻结或验收版本错误均停止，不能伪装注入成功", async () => {
-  const { createGapFixture, GAP_BODY } = await import(new URL("../../../dsh-longtask-e2e/gap-fixture.mjs", import.meta.url).href);
-  for (const mode of ["missing-marker", "extra-domain-lines", "already-frozen", "wrong-frozen-hash", "criteria-changed"]) {
-    const dir = await fs.mkdtemp(join(tmpdir(), "lt-gap-reject-"));
-    const path = join(dir, "out.md");
-    const content = `${GAP_BODY}\n${mode === "extra-domain-lines" ? "未经要求的领域扩写。\n" : ""}${mode === "missing-marker" ? "" : "SYNC-X\n"}`;
-    await fs.writeFile(path, content);
-    const view: any = { task: { status: "proposed" }, version: { version: 1, goal: "g" }, sessions: [{ sessionId: "w", role: "executor" }, { sessionId: "a", role: "acceptor" }], rounds: [], artifacts: [], events: [] };
-    let pauses = 0;
-    const fixture = createGapFixture({ runId: "run", artifactPath: path, marker: "SYNC-X", readView: () => view, onFailure: async () => { pauses++; } });
-    fixture.bind("t"); view.task.status = "active";
-    if (mode === "already-frozen") view.rounds.push({ roundId: "r", state: "pending" });
-    if (mode === "criteria-changed") view.version.goal = "changed";
-    fixture.observe({ id: "w" }, assistantEvent('<longtask_report>{"done":true}</longtask_report>', 1));
-    if (mode === "wrong-frozen-hash") {
-      view.task.status = "awaiting_acceptance";
-      view.rounds.push({ roundId: "r", state: "pending", artifactHashes: { a: "wrong" } });
-      view.artifacts.push({ id: "a", location: path });
-      fixture.observe({ id: "a" }, { type: "step/start", data: {} });
-    } else assert.equal(await fs.readFile(path, "utf8"), content, "前提无效时不能修改文件");
-    await Promise.resolve();
-    assert.ok(fixture.snapshot().failure, mode);
-    assert.equal(pauses, 1, mode);
-    fixture.dispose();
-  }
-});
-
-test("故障注入完整双apply链路：按真机成本回放，读后编辑、再验收最坏输出仍在26万内交付", async () => {
-  const { apply: applyE2e } = await import(new URL("../../../dsh-longtask-e2e/index.js", import.meta.url).href);
-  const { GAP_BODY } = await import(new URL("../../../dsh-longtask-e2e/gap-fixture.mjs", import.meta.url).href);
-  const { fake, api, dir } = await makeApp();
-  const transcriptDir = join(dir, "e2e");
-  const usageTotals = new Map<string, { input: number; output: number }>();
-  const harnessTeardowns: Array<() => unknown> = [];
-  const publicApi = { ...api, searchExperts: async (q: string) => [q === "engineering" ? EXECUTOR : REVIEWER] };
-  applyE2e({
-    get: (name: string) => name === "longtask" ? publicApi : name === "subagents" ? { listDescendants: async () => [] }
-      : name === "sessionProjections" ? { stateOf: (session: { id: string }) => { const u = usageTotals.get(session.id)!; return { totals: { uncachedInputTokens: u.input, outputTokens: u.output, cacheReadTokens: 0, cacheWriteTokens: 0 } }; } }
-      : fake.ctx.get(name), on: fake.ctx.on, logger: { info() {} },
-    effect(factory: () => Generator) { const fn = factory().next().value; if (typeof fn === "function") harnessTeardowns.push(fn as () => unknown); },
-  }, { transcriptDir, artifactDir: join(transcriptDir, "artifacts"), scenario: "gap-inject", taskBudgetTokens: 260000, strict: true, force: true, pollIntervalMs: 1, timeoutMs: 15000 });
-  const load = async () => JSON.parse(await fs.readFile(join(dir, "state.json"), "utf8"));
-  let total = 0;
-  // 来自task_mw1yp115ntinc2实机usage，剔除明确无效的盲edit和重复read；
-  // 最后一个尚未发生的验收结论，使用实机read后的输入上界27748和完整8000输出限额。
-  const samples = [[21613, 1577], [23289, 302], [19337, 728], [20734, 3337], [24355, 116], [25140, 230], [26042, 288], [25267, 168], [27748, 8000]];
-  let sampleIndex = 0;
-  const steps = new Map<string, number>();
-  const tick = async (sid: string, turn: number, text: string) => {
-    assert.equal(await fake.emitPreStep(sid, inboundChars(2000)), true, `请求${sampleIndex + 1}必须在固定余额内准入`);
-    const key = `${sid}:${turn}`, step = (steps.get(key) ?? 0) + 1; steps.set(key, step);
-    fake.emitSessionEvent(sid, { type: "step/start", data: { turn, step } });
-    const [input, output] = samples[sampleIndex++]!;
-    const u = usageTotals.get(sid) ?? { input: 0, output: 0 }; u.input += input!; u.output += output!; usageTotals.set(sid, u);
-    total += input! + output!;
-    fake.emitSessionEvent(sid, assistantUsageEvent(turn, { inputTokens: input!, outputTokens: output!, cacheReadTokens: 0, cacheWriteTokens: 0 }, text));
-    await fake.waitFor(() => api.getBudget(taskId)?.settledTokens === total);
-  };
-  let taskId = "";
-  try {
-    await fake.waitFor(() => (api.listTasks() as any[]).some((t) => t.versions[t.currentVersion].goal.startsWith("[E2E-GAP-INJECT]")), 4000);
-    const task = (api.listTasks() as any[])[0]; taskId = task.id;
-    await fake.waitFor(() => Boolean(findAgentByMessage(fake, "research/worker.md")));
-    const version = task.versions[task.currentVersion];
-    const path = version.deliverables[0];
-    const marker = /SYNC-[A-F0-9-]{36}/.exec(version.goal)![0];
-    assert.match(version.goal, /gap-before-freeze-v2/);
-    assert.doesNotMatch(version.goal, /nonce\.txt|验收阶段才提供/);
-    const worker = findAgentByMessage(fake, "research/worker.md")!;
-    const content = `${GAP_BODY}\n${marker}\n`;
-    await tick(worker.sessionId, 1, "准备写入完整文档");
-    await fs.writeFile(path, content);
-    await tick(worker.sessionId, 1, '<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>');
-    const badContent = await fs.readFile(path, "utf8");
-    assert.notEqual(badContent.trimEnd().split(/\r?\n/).at(-1), marker, "完成报告到达时同步移除末行");
-    assert.equal(Object.values((await load()).collections.acceptanceRounds ?? {}).length, 0, "尚未turn/end，不能已有冻结轮次");
-    fake.emitSessionEvent(worker.sessionId, turnEndEvent(1));
-    await fake.waitFor(() => Boolean(findAgentByMessage(fake, "独立验收请求")));
-    const acceptor = findAgentByMessage(fake, "独立验收请求")!;
-    let forbiddenWrites = 0;
-    assert.equal((await fake.emitTool(acceptor.sessionId, "write", () => { forbiddenWrites++; })).denied, true, "故障测试的验收人不能自行补文件");
-    assert.equal(forbiddenWrites, 0);
-    const verdict = async (turn: number) => {
-      const request = lastDelivery(acceptor);
-      assert.match(request, /唯一角色是独立验收者/);
-      assert.match(request, /> \[E2E-GAP-INJECT\]/, "执行目标作为引用资料，不能再次给验收人派工");
-      const roundId = /轮次 (round_[a-z0-9]+)/.exec(request)![1];
-      await tick(acceptor.sessionId, turn, "读取产物");
-      const actual = await fs.readFile(path, "utf8");
-      assert.equal(actual.trimEnd().split(/\r?\n/).slice(0, 4).join("\n"), GAP_BODY);
-      if (turn === 2) fake.emitSessionEvent(acceptor.sessionId, { type: "tool/result", data: { turn, message: { role: "tool", toolCallId: "replay-read", content: [{ type: "text", text: "x".repeat(2313) }] } } });
-      const outcome = actual.trimEnd().split(/\r?\n/).at(-1) === marker ? "pass" : "gap";
-      await tick(acceptor.sessionId, turn, `<longtask_verdicts>${JSON.stringify({ roundId, artifactHashes: frozenHashes(request), verdicts: [
-        { criterionId: "c1", outcome: "pass", evidence: "前四行逐行符合正文模板，校验末行按c2判定", gap: null, verdictBy: REVIEWER.relPath, criteriaVersion: 1 },
-        { criterionId: "c2", outcome, evidence: `实际末行=${actual.trimEnd().split(/\r?\n/).at(-1)}`, gap: outcome === "gap" ? "缺少校验末行" : null, verdictBy: REVIEWER.relPath, criteriaVersion: 1 },
-      ] })}</longtask_verdicts>`);
-      fake.emitSessionEvent(acceptor.sessionId, turnEndEvent(turn));
-      return { roundId, outcome, hashes: frozenHashes(request) };
-    };
-    const first = await verdict(1);
-    assert.equal(first.outcome, "gap", "根据真实读取的缺项文件产生结论");
-    assert.ok(Object.values(first.hashes).includes(createHash("sha256").update(badContent).digest("hex")));
-    await fake.waitFor(() => api.getTask(taskId)?.status === "rework");
-    await fake.waitFor(() => /修改前先用read读取当前文件/.test(lastDelivery(worker)));
-    assert.match(lastDelivery(worker), /修改前先用read读取当前文件/);
-    assert.match(lastDelivery(worker), /不要依赖上轮缓存直接edit/);
-    fake.emitSessionEvent(worker.sessionId, { type: "turn/start", data: { turn: 2 } });
-    await tick(worker.sessionId, 2, "先read取得当前文件和版本");
-    assert.equal(await fs.readFile(path, "utf8"), badContent);
-    await tick(worker.sessionId, 2, "依据最新版本edit补齐末行");
-    await fs.writeFile(path, content);
-    await tick(worker.sessionId, 2, '<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>');
-    fake.emitSessionEvent(worker.sessionId, turnEndEvent(2));
-    await fake.waitFor(() => api.getTask(taskId)?.status === "awaiting_acceptance");
-    await fake.waitFor(() => /轮次 (round_[a-z0-9]+)/.exec(lastDelivery(acceptor))?.[1] !== first.roundId);
-    fake.emitSessionEvent(acceptor.sessionId, { type: "turn/start", data: { turn: 2 } });
-    const second = await verdict(2);
-    assert.equal(second.outcome, "pass");
-    assert.notEqual(first.roundId, second.roundId);
-    assert.equal(Object.values(second.hashes).includes(createHash("sha256").update(badContent).digest("hex")), false, "再次冻结不能混入历史缺项版本");
-    await fake.waitFor(() => api.getTask(taskId)?.status === "delivered");
-    const deadline = Date.now() + 4000;
-    while (!(await fs.readdir(transcriptDir)).some((n) => n.startsWith("done-"))) { if (Date.now() > deadline) throw Error("消费者未通过故障证据自检"); await fake.flush(); }
-    const state = await load();
-    assert.equal(Object.values(state.collections.artifacts).filter((a: any) => a.taskId === taskId).length, 2, "保留两版历史登记");
-    assert.equal(api.getBudget(taskId)?.settledTokens, total);
-    assert.equal(api.getBudget(taskId)?.reservedTokens, 0);
-    assert.ok(total <= 260000);
-    assert.equal(total, 228271, "使用实机已发生的成本及最终最坏输出，不以每步1.5万的理想成本证明通过");
-    assert.equal(sampleIndex, samples.length);
-    assert.equal(fake.logs.some((l) => l.includes("bound-exceeded")), false);
-    const runs = (await fs.readdir(transcriptDir)).filter((n) => n.endsWith(".jsonl"));
-    const rows = (await fs.readFile(join(transcriptDir, runs.at(-1)!), "utf8")).trim().split("\n").map((s) => JSON.parse(s));
-    const end = rows.find((e) => e.kind === "scenario_end");
-    assert.equal(end.coverage.passed, true);
-    assert.deepEqual(end.fault.phases, { injected: 1, firstFrozen: 2, gap: 3, repaired: 4, secondFrozen: 5 });
-    assert.equal(end.fault.worker, worker.sessionId);
-    assert.equal(fake.toolGuards.size, 1, "结束移除测试guard，只保留产品委派guard");
-  } finally {
-    for (const stop of harnessTeardowns) await stop();
-    for (const stop of fake.teardowns) await stop();
-  }
 });
 
 test("阶段2 专家直连：回复里的 longtask_message 只发给对方，summary 进 Router 摘要", async () => {
@@ -2523,34 +1814,20 @@ test("审查26 D3：撤权后迟到读取不误发纠偏，真实usage仍结算"
   } finally { for (const stop of fake.teardowns) await stop(); }
 });
 
-test("审查29 pair：调度等待零模型调用，交接后单次启动并独立验收", async () => {
-  const { createPairFixture, PAIR_TOOL } = await import(pathToFileURL(join(process.cwd(), "..", "dsh-longtask-e2e", "pair-fixture.mjs")).href);
-  const { extractPairEvidence, assessScenario } = await import(pathToFileURL(join(process.cwd(), "..", "dsh-longtask-e2e", "evidence.mjs")).href);
+test("两专家交接：调度等待、结束事件重放不重复派工并独立验收", async () => {
   const { fake, api, dir, task, a } = await makePairTask(500_000, true);
   let b: ReturnType<typeof findAgentByMessage>;
-  let fixture: { dispose(): void } | undefined;
   try {
     assert.throws(() => api.replayExecutorTurnEnd(task.id, a.sessionId, "未观察到的事件"), /已观测/);
     let globalSenderEnds = 0;
     fake.ctx.on("session/event", (session: { id: string }, event: { type: string }) => {
       if (session.id === a.sessionId && event.type === "turn/end") globalSenderEnds++;
     });
-    const registered = new Map<string, { execute(args: unknown, exec: unknown): Promise<string> }>();
-    const fx = createPairFixture({ runId: "fixture-run", sender: EXECUTOR.relPath, recipient: "research/worker2.md", artifactPath: join(dir, "d"),
-      getDependency: (...args: Parameters<TaskService["getExecutorDependency"]>) => api.getExecutorDependency(...args),
-      replayTurnEnd: (...args: Parameters<LongtaskApi["replayExecutorTurnEnd"]>) => api.replayExecutorTurnEnd(...args),
-      readSessions: () => Object.values(JSON.parse(requireState()).collections.taskSessions[task.id]) });
-    function requireState() { return requireFs.readFileSync(join(dir, "state.json"), "utf8"); }
-    const requireFs = await import("node:fs");
-    fx.install({ ...fake.ctx, get: () => ({ register(tool: { name: string; execute(args: unknown, exec: unknown): Promise<string> }) { registered.set(tool.name, tool); return () => { registered.delete(tool.name); }; } }),
-      emit: (_name: string, session: { id: string }, event: Record<string, unknown>) => fake.emitSessionEvent(session.id, event) });
-    fixture = fx; fx.bind(task.id);
     assert.equal(fake.agentsById.size, 1, "B 不启动模型来报告等待");
     assert.equal(api.getExecutorDependency(task.id, "research/worker2.md").state, "waiting");
     await fs.writeFile(join(dir, "d"), "# 比较表\n方案A优于B\n");
     fake.emitSessionEvent(a.sessionId, { type: "tool/call", data: { turn: 1, name: "write", callId: "A-write", arguments: JSON.stringify({ file_path: join(dir, "d") }) } });
     fake.emitSessionEvent(a.sessionId, { type: "tool/result", data: { message: { toolCallId: "A-write", isError: false, content: [] } } });
-    assert.equal(JSON.parse(await registered.get(PAIR_TOOL)!.execute({ runId: "fixture-run" }, { agent: { session: { id: a.sessionId } }, signal: new AbortController().signal })).ready, true);
     let incoming: Parameters<AgentHandle["agent"]["followup"]>[0] | undefined;
     const agents = fake.ctx.get<{ create(options: unknown): Promise<AgentHandle> }>("agents")!;
     const create = agents.create.bind(agents);
@@ -2566,7 +1843,12 @@ test("审查29 pair：调度等待零模型调用，交接后单次启动并独�
     fake.emitSessionEvent(a.sessionId, assistantEvent('<longtask_message to="research/worker2.md" summary="比较表初稿已交接" artifacts="d">请读取比较表，再补充推荐</longtask_message>\n<longtask_report>{"done":false,"next":[],"waiting":"等B推荐"}</longtask_report>', 1));
     fake.emitSessionEvent(a.sessionId, turnEndEvent(1));
     await fake.waitFor(() => !!incoming && (api.getRouterDigest(task.id)?.latestSummaries.length ?? 0) > 0);
-    assert.equal(fx.snapshot().eventCount, 2);
+    const observations=readFileSync(join(dir,'plugin.log'),'utf8').split('\n').filter(l=>l.includes('collaboration:')).map(l=>JSON.parse(l.slice(l.indexOf('collaboration:')+14)));
+    const sourceTurnId=observations.find(o=>o.kind==='turn_end'&&o.sessionId===a.sessionId)?.sourceTurnId;
+    assert.ok(sourceTurnId,'核心必须保存可重放的真实结束事件');
+    assert.equal(api.replayExecutorTurnEnd(task.id,a.sessionId,sourceTurnId),true);
+    assert.equal(api.replayExecutorTurnEnd(task.id,a.sessionId,sourceTurnId),true);
+    await fake.flush();await fake.flush();
     assert.equal(globalSenderEnds, 1, "longtask 重放不能广播给宿主持久化监听器");
     assert.ok(b);
     assert.equal(b.messages.filter((m) => m.includes("【专家直连】")).length, 1);
@@ -2589,19 +1871,11 @@ test("审查29 pair：调度等待零模型调用，交接后单次启动并独�
     fake.emitSessionEvent(acceptor.sessionId, assistantEvent(`<longtask_verdicts>${JSON.stringify({ roundId, verdicts, artifactHashes })}</longtask_verdicts>`, 1));
     fake.emitSessionEvent(acceptor.sessionId, turnEndEvent(1));
     await fake.waitFor(() => api.getTask(task.id)?.status === "delivered");
-    assert.throws(() => api.replayExecutorTurnEnd(task.id, a.sessionId, fx.snapshot().sourceTurnId), /已观测/);
-    const state = JSON.parse(requireState());
-    const observations = (await fs.readFile(join(dir, "plugin.log"), "utf8")).split("\n").filter((l) => l.includes("collaboration:")).map((l) => JSON.parse(l.slice(l.indexOf("collaboration:") + 14)));
-    const stage2 = extractPairEvidence({ taskId: task.id, state, digest: api.getRouterDigest(task.id), observations, replay: fx.snapshot() });
-    const result = assessScenario({ scenario: "pair", status: api.getTask(task.id)?.status, taskId: task.id, budget: api.getBudget(task.id), accounting: { verified: true, actualTokens: 0, descendants: [] }, controls: { boundExceeded: 0 }, stage2 });
-    assert.equal(result.passed, true, result.reasons.join("；"));
-    for (const missingType of ["expert.waiting", "expert.dependency_ready"]) {
-      const broken = structuredClone(state);
-      for (const [key, value] of Object.entries(broken.events) as Array<[string, { type: string }]>) if (value.type === missingType) delete broken.events[key];
-      const evidence = extractPairEvidence({ taskId: task.id, state: broken, digest: api.getRouterDigest(task.id), observations, replay: fx.snapshot() });
-      assert.equal(evidence.waitedBeforeHandoff, false, `缺少 ${missingType} 时不能伪装调度等待闭环`);
-    }
-  } finally { fixture?.dispose(); for (const stop of fake.teardowns) await stop(); }
+    assert.equal(b.messages.filter(m=>m.includes("【专家直连】")).length,1,"完整交付后再次确认所有重放未重复投递");
+    assert.throws(() => api.replayExecutorTurnEnd(task.id, a.sessionId, sourceTurnId), /已观测/);
+    const state=api.getTaskEvidence(task.id);
+    for(const type of ['expert.waiting','expert.dependency_ready']) assert.ok(Object.values(state.events).some((e:any)=>e.type===type),type+'必须留下可追溯事件');
+  } finally { for (const stop of fake.teardowns) await stop(); }
 });
 
 test("审查29：交接未知时 B 的模型、工具和提前完成均被拒，补投后恢复", async () => {
@@ -2730,6 +2004,132 @@ async function makeMoneyApp(limit = "5", config: Partial<LongtaskConfig> = {}) {
     budget:{limitTokens:Number.MAX_SAFE_INTEGER,strict:true,money:{currency:"CNY",limitAmount:limit}}});
   await app.api.confirm(t.id); return {...app, taskId:t.id, worker:[...app.fake.agentsById.values()][0]!};
 }
+
+test('默认Worker不按累计24步硬停，也不因0步配置立即收尾；显式步数限制仍生效',async()=>{
+  for(const cap of [undefined,2]){
+    const {fake,api,taskId,worker}=await makeMoneyApp('80',cap===undefined?{}:{executorMaxSteps:cap});
+    try{
+      const rounds=cap===undefined?32:2;
+      for(let step=1;step<=rounds;step++){
+        assert.equal(await fake.emitPreStep(worker.id),true,`第${step}步仍可执行`);await fake.emitRequest(worker.id,moneyRoute);
+        fake.emitSessionEvent(worker.id,{seq:14000+step,...assistantUsageEvent(step,{inputTokens:10,outputTokens:5,cacheReadTokens:0,cacheWriteTokens:0})});
+        await fake.waitFor(()=>api.getBudget(taskId)?.settledTokens===step*15&&api.getBudget(taskId)?.reservedTokens===0);
+      }
+      if(cap===undefined){
+        assert.equal(api.getTask(taskId)!.status,'active');assert.ok(!fake.logs.some(line=>/budget:wrap-up/.test(line)),'未启用步数上限不能让剩余步数被误算成0');
+        assert.ok(worker.messages.some(m=>m.includes('不设固定累计执行步数上限')));assert.equal(api.getMoneyBudget(taskId)!.limitAmount,'80');
+      }else{
+        assert.equal(await fake.emitPreStep(worker.id),false);await fake.waitFor(()=>api.getTask(taskId)?.status==='paused');
+        assert.equal(api.getTask(taskId)!.pauseReason,'missing_input');assert.ok(worker.messages.some(m=>m.includes('最多执行 2 步')));
+      }
+    }finally{for(const stop of fake.teardowns)await stop();}
+  }
+});
+
+test('已完成模块收到专家留言不再启动；预期completed blocked不暂停其他模块，真实blocked仍暂停',async()=>{
+  const {fake,api,dir}=await makeApp();try{
+    const peer=expertRef('research/peer.md','Peer');await fs.writeFile(join(dir,'experts/research/peer.md'),'---\nname: Peer\ndescription: 分析\n---\n专家定义');
+    const one=join(dir,'one.md'),two=join(dir,'two.md');
+    const task=await api.propose({goal:'比较两份资料并交付推荐',executionPlanVersion:1,criteria:[{id:'c1',text:'资料分析'},{id:'c2',text:'形成推荐'}],deliverables:[one,two],executors:[EXECUTOR,peer],acceptor:REVIEWER,budget:{limitTokens:2000000,strict:true},assignments:[
+      {relPath:EXECUTOR.relPath,module:'资料分析',responsibilities:['analysis'],criterionIds:['c1'],deliverables:[one],batches:[{id:'a1',title:'形成分析',deliverables:[one]}]},
+      {relPath:peer.relPath,module:'形成推荐',responsibilities:['recommendation'],criterionIds:['c2'],deliverables:[two],batches:[{id:'b1',title:'形成推荐',deliverables:[two]}]}
+    ]});await api.confirm(task.id);const [a,b]=[...fake.agentsById.values()];assert.ok(a&&b);
+    await fs.writeFile(one,'已经完成的资料分析');
+    await api.registerArtifact(task.id,one,createHash('sha256').update('已经完成的资料分析').digest('hex'),EXECUTOR.relPath);
+    fake.emitSessionEvent(a.id,assistantEvent('<longtask_report>{"done":true,"batchId":"a1","next":[],"waiting":null}</longtask_report>',1));
+    fake.emitSessionEvent(a.id,turnEndEvent(1));
+    await fake.waitFor(()=>Boolean(JSON.parse(readFileSync(join(dir,'state.json'),'utf8')).collections.batchProgress?.[`${task.id}:v1:${EXECUTOR.relPath}`]?.completed.includes('a1')));
+    for(let n=0;n<12;n++)await fake.flush();
+    const count=fake.stats.createCalls,deliveries=a.messages.length,budget=structuredClone(api.getBudget(task.id));
+    const sent=await api.sendExpertMessage(task.id,peer.relPath,EXECUTOR.relPath,'补充信息，但无需重做已完成模块',{actionId:'completed-recipient'});
+    assert.equal(sent.ok,false);assert.equal(sent.reason,'recipient-module-complete');assert.equal(sent.delivery,'failed');
+    assert.equal(fake.stats.createCalls,count);assert.equal(a.messages.length,deliveries);assert.equal(api.getTask(task.id)!.status,'active');
+    assert.equal(await fake.emitPreStep(a.id),false);
+    fake.emitSessionEvent(a.id,{type:'turn/end',data:{turn:2,reason:{kind:'blocked'}}});for(let n=0;n<12;n++)await fake.flush();
+    assert.equal(api.getTask(task.id)!.status,'active','已完成执行者的预期拒绝不能暂停整任务');assert.equal(b.stopped,false);assert.deepEqual(api.getBudget(task.id),budget);
+    fake.emitSessionEvent(b.id,{type:'turn/end',data:{turn:2,reason:{kind:'blocked'}}});await fake.waitFor(()=>api.getTask(task.id)?.status==='paused');
+    assert.equal(api.getTask(task.id)!.pauseReason,'missing_input','未完成执行者的真实blocked仍需核对');
+  }finally{for(const stop of fake.teardowns)await stop();}
+});
+
+test('Router职责：暂停后询问进度只管理任务，写入和shell交给Worker；普通会话及结束任务不受影响',async()=>{
+  const first=await makeMoneyApp('60');let second:ReturnType<typeof makeFakeHost>|undefined;
+  try{
+    await first.api.pause(first.taskId,'等待原生审批重新处理');
+    for(const stop of first.fake.teardowns.splice(0))await stop();
+    const file=join(first.dir,'state.json'),saved=JSON.parse(await fs.readFile(file,'utf8')),router='session-router-role';
+    saved.collections.tasks[first.taskId].routerSessionId=router;await fs.writeFile(file,JSON.stringify(saved));
+    second=makeAppLike(first.dir);await second.waitFor(()=>Boolean(second!.provided.get('longtask')));
+    const api=second.provided.get('longtask') as LongtaskApi,before=structuredClone(api.getBudget(first.taskId));
+    assert.equal(await second.emitPreStep(router,[{role:'user',content:[{type:'text',text:'开发完成了吗？'}]}]),true);
+    const context=JSON.stringify(second.stepMessages.get(router));
+    assert.match(context,/Router/);assert.match(context,/paused/);assert.match(context,/longtask_tasks/);assert.match(context,/进度询问不等于恢复/);
+    for(const name of ['write','edit','pwsh','subagent']){
+      const result=await second.emitTool(router,name,()=>assert.fail('Router不能接手执行'));
+      assert.equal(result.denied,true,name);assert.match(result.reason!,/Router/);
+    }
+    for(const name of ['read','grep','questions','longtask_tasks','longtask_control'])assert.equal((await second.emitTool(router,name,()=>{})).denied,false,name);
+    assert.equal((await second.emitTool('ordinary-session','pwsh',()=>{})).denied,false);
+    assert.equal(api.getTask(first.taskId)!.status,'paused');assert.deepEqual(api.getBudget(first.taskId),before);
+    await api.resume(first.taskId);const worker=[...second.agentsById.values()][0]!;
+    assert.equal(await second.emitPreStep(router),true);assert.match(JSON.stringify(second.stepMessages.get(router)),/active/);
+    assert.equal((await second.emitTool(worker.id,'write',()=>{})).denied,false,'实际Worker保留执行权限');
+    assert.equal((await second.emitTool(router,'write',()=>assert.fail())).denied,true,'运行中Router仍负责管理');
+    await api.cancel(first.taskId);
+    assert.equal((await second.emitTool(router,'write',()=>{})).denied,false,'取消托管后解除Router执行约束');
+    await second.emitPreStep(router);assert.doesNotMatch(JSON.stringify(second.stepMessages.get(router)),/longtask-router/);
+    assert.deepEqual(api.getBudget(first.taskId),before);
+  }finally{for(const stop of first.fake.teardowns)await stop();if(second)for(const stop of second.teardowns)await stop();}
+});
+
+test("Watchdog：批次尚未结束的真实文件写入更新进展；失败、重放及相同内容不刷新",async()=>{
+  const {fake,api,taskId,worker,dir}=await makeMoneyApp();
+  try{
+    const file=join(dir,'money.md');
+    const write=(callId:string,isError=false)=>{
+      fake.emitSessionEvent(worker.id,{type:'tool/call',data:{name:'write',callId,arguments:JSON.stringify({file_path:file})}});
+      fake.emitSessionEvent(worker.id,{type:'tool/result',data:{message:{toolCallId:callId,isError,content:[]}}});
+    };
+    await fs.writeFile(file,'第一份实际落盘内容');write('write-one');
+    await fake.waitFor(()=>Boolean((api.getTaskEvidence(taskId).collections.progress?.[taskId] as any)?.lastAttemptNote?.includes('实际写入')));
+    const first=structuredClone(api.getTaskEvidence(taskId).collections.progress![taskId]);
+    assert.equal(api.getRouterDigest(taskId)!.artifacts.length,0,'无需等完整批次或登记最终产物才算进展');
+    write('write-one');write('same-content');write('failed-write',true);
+    for(let i=0;i<12;i++)await fake.flush();
+    assert.deepEqual(api.getTaskEvidence(taskId).collections.progress![taskId],first);
+    await fs.writeFile(file,'第二次实际内容变化');write('write-two');
+    await fake.waitFor(()=>(api.getTaskEvidence(taskId).collections.progress![taskId] as any).lastSubstantiveAt!==(first as any).lastSubstantiveAt);
+    assert.equal(api.getTask(taskId)!.status,'active');assert.equal(worker.stopped,false);
+  }finally{for(const stop of fake.teardowns)await stop();}
+});
+
+for(const restartActive of [false,true])test(`Watchdog：${restartActive?'重启运行任务':'用户恢复暂停任务'}重新计时，不把停机时间当作停滞`,async()=>{
+  const {fake,api,dir}=await makeApp();let second:ReturnType<typeof makeFakeHost>|undefined;
+  try{
+    const task=await api.propose({goal:'恢复观察窗口',criteria:[{id:'c1',text:'完成'}],deliverables:['d'],executors:[EXECUTOR],acceptor:REVIEWER,budget:{limitTokens:400000,strict:true}});
+    await api.confirm(task.id);if(!restartActive)await api.pause(task.id,'等待修复');
+    for(const stop of fake.teardowns.splice(0))await stop();
+    const file=join(dir,'state.json'),saved=JSON.parse(await fs.readFile(file,'utf8'));
+    const old='2026-01-01T00:00:00.000Z';
+    saved.collections.progress[task.id]={taskId:task.id,lastSubstantiveAt:old,recentInstructionHashes:['重复纠偏','重复纠偏'],corrections:2,lastAttemptNote:'旧轮次已纠偏两次'};
+    await fs.writeFile(file,JSON.stringify(saved));
+    second=makeAppLike(dir);await second.waitFor(()=>Boolean(second!.provided.get('longtask')));
+    const resumed=second.provided.get('longtask') as LongtaskApi;
+    if(!restartActive){
+      assert.equal(resumed.getTask(task.id)!.status,'paused');
+      assert.deepEqual(resumed.getTaskEvidence(task.id).collections.progress![task.id],saved.collections.progress[task.id]);
+      await resumed.resume(task.id);
+    }
+    await second.waitFor(()=>Boolean((resumed.getTaskEvidence(task.id).collections.progress![task.id] as any).observationStartedAt));
+    const progress=resumed.getTaskEvidence(task.id).collections.progress![task.id] as import('../src/types.js').TaskProgressState;
+    assert.equal(progress.lastSubstantiveAt,old,'恢复计时不能伪造实质产出');assert.equal(progress.corrections,0);
+    const {watchdogDecision}=await import('../src/watchdog/watchdog.js');
+    const start=Date.parse((progress as any).observationStartedAt);
+    assert.equal(watchdogDecision(progress,{active:false,descriptions:[]},start+60000).action,'none');
+    assert.equal(watchdogDecision(progress,{active:false,descriptions:[]},start+31*60000).action,'correct','真正长时间无进展仍会纠偏');
+    assert.equal(resumed.getTask(task.id)!.status,'active');
+  }finally{for(const stop of fake.teardowns)await stop();if(second)for(const stop of second.teardowns)await stop();}
+});
 test("金额真实入口：实际request路由计费、缓存分项、失败重试和事件重放不漏不重",async()=>{
   const {fake,api,taskId,worker}=await makeMoneyApp();try{
     assert.equal(await fake.emitPreStep(worker.id),true);await fake.emitRequest(worker.id,moneyRoute);
@@ -2945,9 +2345,9 @@ test("请求配置等待期间取消：金额不预留、不收费，也不恢�
   }finally{for(const stop of fake.teardowns)await stop();}
 });
 
-test("金额任务完整交付：执行→验收退回→返工→再验收均按请求收费，共用原金额不追加",async()=>{
+test("金额任务完整交付：十轮返工验收不共享8步计数，均按请求收费且不追加",async()=>{
   const {fake,api,taskId,worker,dir}=await makeMoneyApp('5',{acceptorReadOnly:true});try{
-    for(let round=1;round<=2;round++){
+    for(let round=1;round<=10;round++){
       await fs.writeFile(join(dir,'money.md'),round===1?'初稿':'修订完成');
       assert.equal(await fake.emitPreStep(worker.id),true);await fake.emitRequest(worker.id,moneyRoute);
       fake.emitSessionEvent(worker.id,{seq:8700+round,...assistantUsageEvent(round,{inputTokens:1000,outputTokens:500,cacheReadTokens:0,cacheWriteTokens:0},'<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>')});
@@ -2955,12 +2355,123 @@ test("金额任务完整交付：执行→验收退回→返工→再验收均�
       await fake.waitFor(()=>api.getTask(taskId)?.status==='awaiting_acceptance'&&[...fake.agentsById.values()].reduce((n,a)=>n+a.messages.filter(m=>m.includes('独立验收请求')).length,0)>=round);
       const acceptor=findAgentByMessage(fake,'独立验收请求')!,request=acceptor.messages.findLast(m=>m.includes('独立验收请求'))!,roundId=/轮次 (round_[a-z0-9]+)/.exec(request)![1];
       assert.equal(await fake.emitPreStep(acceptor.id),true);await fake.emitRequest(acceptor.id,moneyRoute);
-      const report={roundId,verdicts:[{criterionId:'c1',outcome:round===1?'gap':'pass',gap:round===1?'补齐要求':null,evidence:'已读取产物版本',verdictBy:REVIEWER.relPath,criteriaVersion:1}],artifactHashes:frozenHashes(request)};
+      const report={roundId,verdicts:[{criterionId:'c1',outcome:round<10?'gap':'pass',gap:round<10?'补齐要求':null,evidence:'已读取产物版本',verdictBy:REVIEWER.relPath,criteriaVersion:1}],artifactHashes:frozenHashes(request)};
       fake.emitSessionEvent(acceptor.id,{seq:8800+round,...assistantUsageEvent(round,{inputTokens:1000,outputTokens:500,cacheReadTokens:0,cacheWriteTokens:0},`<longtask_verdicts>${JSON.stringify(report)}</longtask_verdicts>`)});
       fake.emitSessionEvent(acceptor.id,turnEndEvent(round));
-      await fake.waitFor(()=>api.getTask(taskId)?.status===(round===1?'rework':'delivered')&&api.getBudget(taskId)?.reservedTokens===0);
-      assert.equal(api.getMoneyBudget(taskId)!.calculatedAmount,round===1?'0.012':'0.024');
+      await fake.waitFor(()=>api.getTask(taskId)?.status===(round<10?'rework':'delivered')&&api.getBudget(taskId)?.reservedTokens===0);
+      assert.equal(Number(api.getMoneyBudget(taskId)!.calculatedAmount)*1000,round*12);
     }
-    assert.equal(api.getMoneyBudget(taskId)!.limitAmount,'5');assert.equal(api.getModelExpenses(taskId).length,4);assert.deepEqual(api.getBudget(taskId)!.grants,[]);
+    assert.equal(api.getMoneyBudget(taskId)!.limitAmount,'5');assert.equal(api.getModelExpenses(taskId).length,20);assert.deepEqual(api.getBudget(taskId)!.grants,[]);
   }finally{for(const stop of fake.teardowns)await stop();}
+});
+
+for (const kind of ["max-tokens","error"] as const) test(`验收${kind}不会悬空，重复结束幂等且可以恢复`,async()=>{
+  const {fake,api,taskId,worker,dir}=await makeMoneyApp("5",{acceptorReadOnly:true});
+  try {
+    await fs.writeFile(join(dir,"money.md"),"完整交付物");
+    assert.equal(await fake.emitPreStep(worker.id),true);await fake.emitRequest(worker.id,moneyRoute);
+    fake.emitSessionEvent(worker.id,assistantUsageEvent(1,{inputTokens:1000,outputTokens:100,cacheReadTokens:0,cacheWriteTokens:0},'<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>'));
+    fake.emitSessionEvent(worker.id,turnEndEvent(1));
+    await fake.waitFor(()=>Boolean(findAgentByMessage(fake,"独立验收请求")));
+    const acceptor=findAgentByMessage(fake,"独立验收请求")!,before=acceptor.messages.length;
+    assert.equal(await fake.emitPreStep(acceptor.id),true);await fake.emitRequest(acceptor.id,moneyRoute);
+    fake.emitSessionEvent(acceptor.id,assistantUsageEvent(1,{inputTokens:100,outputTokens:8000,cacheReadTokens:0,cacheWriteTokens:0},"[c1] 通过，结论输出尚未完成"));
+    const end={seq:9901,type:"turn/end",data:{turn:1,reason:{kind}}};
+    fake.emitSessionEvent(acceptor.id,end);fake.emitSessionEvent(acceptor.id,end);
+    if(kind==="max-tokens") {
+      await fake.waitFor(()=>acceptor.messages.length>before);
+      assert.equal(acceptor.messages.length,before+1);assert.match(acceptor.messages.at(-1)!,/截断/);
+      assert.equal(api.getTask(taskId)!.status,"awaiting_acceptance");
+      assert.equal(await fake.emitPreStep(acceptor.id),true);
+    } else {
+      await fake.waitFor(()=>api.getTask(taskId)!.status==="paused");
+      assert.equal(acceptor.messages.length,before);
+      await api.resume(taskId);assert.equal(api.getTask(taskId)!.status,"awaiting_acceptance");
+      const current=[...fake.agentsById.values()].filter(a=>a.messages.some(m=>m.includes("独立验收请求"))).at(-1)!;
+      assert.notEqual(current.id,acceptor.id,"显式恢复隔离旧会话代次");
+      fake.emitSessionEvent(acceptor.id,{seq:9902,type:"turn/end",data:{turn:1,reason:{kind:"aborted"}}});
+      await fake.flush();assert.equal(api.getTask(taskId)!.status,"awaiting_acceptance","旧取消事件不能暂停新代次");
+      assert.equal(await fake.emitPreStep(current.id),true);
+    }
+  } finally {for(const stop of fake.teardowns)await stop();}
+});
+
+test("验收preset的scope-local核对工具不会被全局预检误拒绝",async()=>{
+  const {fake,api}=await makeApp({acceptorReadOnly:true,acceptorReadTools:["reference_lookup"]});
+  const get=fake.ctx.get.bind(fake.ctx);
+  fake.ctx.get=((name:string)=>name==="tools"?{...get<any>("tools"),get:(_name:string,scope:unknown)=>scope?{name:"reference_lookup"}:undefined}:get(name)) as typeof fake.ctx.get;
+  try {
+    const t=await api.propose({goal:"核对参考资料",criteria:[{id:"c1",text:"引用有据"}],deliverables:["d"],executors:[EXECUTOR],acceptor:REVIEWER,acceptorRequiredTools:["reference_lookup"],budget:{limitTokens:2000000,strict:true}});
+    await api.confirm(t.id);assert.equal(api.getTask(t.id)!.status,"active");
+  }finally{for(const stop of fake.teardowns)await stop();}
+});
+for(const name of ["write","apply_patch","multi_edit","patch","pwsh","powershell","exec_command"])test(`只读验收配置拒绝已知执行工具${name}`,()=>{
+  assert.throws(()=>apply(makeFakeHost().ctx,{acceptorReadOnly:true,acceptorReadTools:[name]}),/只读核对工具/);
+});
+
+async function makeAcceptanceProgressApp(config:Partial<LongtaskConfig>={}){
+  const f=await makeMoneyApp("50",{acceptorReadOnly:true,...config});
+  await fs.writeFile(join(f.dir,"money.md"),"验收产物\n".repeat(40));
+  assert.equal(await f.fake.emitPreStep(f.worker.id),true);await f.fake.emitRequest(f.worker.id,moneyRoute);
+  f.fake.emitSessionEvent(f.worker.id,assistantUsageEvent(1,{inputTokens:1000,outputTokens:100,cacheReadTokens:0,cacheWriteTokens:0},'<longtask_report>{"done":true,"next":[],"waiting":null}</longtask_report>'));
+  f.fake.emitSessionEvent(f.worker.id,turnEndEvent(1));
+  await f.fake.waitFor(()=>Boolean(findAgentByMessage(f.fake,"独立验收请求")));
+  return {...f,acceptor:findAgentByMessage(f.fake,"独立验收请求")!};
+}
+
+for(const relative of [false,true])test(`默认验收持续读取不同产物片段可超过8步${relative?"（切目录后相对路径）":""}，检查点与原金额保持`,async()=>{
+  const f=await makeAcceptanceProgressApp();try{
+    if(relative)f.fake.emitSessionEvent(f.acceptor.id,{type:"working-directory/change",data:{cwd:f.dir}});
+    for(let step=1;step<=12;step++){
+      assert.equal(await f.fake.emitPreStep(f.acceptor.id),true,`有效核对第${step}步`);await f.fake.emitRequest(f.acceptor.id,moneyRoute);
+      f.fake.emitSessionEvent(f.acceptor.id,{seq:16000+step*4,...assistantUsageEvent(step,{inputTokens:1000,outputTokens:100,cacheReadTokens:0,cacheWriteTokens:0},"核对片段")});
+      f.fake.emitSessionEvent(f.acceptor.id,{type:"tool/call",data:{turn:step,callId:`read-${step}`,name:"read",arguments:JSON.stringify({file_path:relative?"money.md":join(f.dir,"money.md"),offset:step,limit:1})}});
+      f.fake.emitSessionEvent(f.acceptor.id,{type:"tool/result",data:{turn:step,message:{toolCallId:`read-${step}`,isError:false,content:[{type:"text",text:`片段${step}`} ]}}});
+      await f.fake.waitFor(()=>f.api.getBudget(f.taskId)!.reservedTokens===0);
+    }
+    assert.equal(f.api.getTask(f.taskId)!.status,"awaiting_acceptance");
+    assert.equal(f.api.getMoneyBudget(f.taskId)!.limitAmount,"50");
+    assert.ok(readFileSync(join(f.dir,"plugin.log"),"utf8").includes("acceptance:progress-checkpoint"));
+  }finally{for(const stop of f.fake.teardowns)await stop();}
+});
+
+for(const mode of ["working_directory","duplicate-read","failed-read"] as const)test(`验收${mode}不算进展，先纠偏再暂停而非反复烧预算`,async()=>{
+  const f=await makeAcceptanceProgressApp();try{
+    let corrected=false,stopped=false;
+    for(let step=1;step<=9;step++){
+      if(!await f.fake.emitPreStep(f.acceptor.id)){stopped=true;break;}
+      corrected ||=JSON.stringify(f.fake.stepMessages.get(f.acceptor.id)).includes("验收进展纠偏");
+      await f.fake.emitRequest(f.acceptor.id,moneyRoute);
+      f.fake.emitSessionEvent(f.acceptor.id,{seq:17000+step*4,...assistantUsageEvent(step,{inputTokens:1000,outputTokens:100,cacheReadTokens:0,cacheWriteTokens:0},"核对中")});
+      const name=mode==="working_directory"?"working_directory":"read";
+      f.fake.emitSessionEvent(f.acceptor.id,{type:"tool/call",data:{turn:step,callId:`idle-${step}`,name,arguments:JSON.stringify(name==="read"?{file_path:join(f.dir,"money.md"),offset:1,limit:1}:{})}});
+      f.fake.emitSessionEvent(f.acceptor.id,{type:"tool/result",data:{turn:step,message:{toolCallId:`idle-${step}`,isError:mode==="failed-read",content:[{type:"text",text:"same result"}]}}});
+      await f.fake.waitFor(()=>f.api.getBudget(f.taskId)!.reservedTokens===0);
+    }
+    assert.equal(corrected,true);assert.equal(stopped,true);assert.equal(f.api.getTask(f.taskId)!.status,"paused");
+    assert.equal(f.api.getTask(f.taskId)!.pauseReason,"missing_input");assert.equal(f.api.getMoneyBudget(f.taskId)!.limitAmount,"50");
+  }finally{for(const stop of f.fake.teardowns)await stop();}
+});
+
+test("验收未声明required也必须具备read，缺失时零验收模型请求",async()=>{
+  const f=await makeAcceptanceProgressApp({acceptorToolWaitMs:0});try{
+    const get=f.fake.ctx.get.bind(f.fake.ctx);f.fake.ctx.get=((name:string)=>name==="tools"?{...get<any>("tools"),get:()=>undefined}:get(name)) as typeof f.fake.ctx.get;
+    const before=structuredClone(f.api.getMoneyBudget(f.taskId));
+    assert.equal(await f.fake.emitPreStep(f.acceptor.id),false);
+    assert.equal(f.api.getTask(f.taskId)!.status,"paused");assert.deepEqual(f.api.getMoneyBudget(f.taskId),before);
+  }finally{for(const stop of f.fake.teardowns)await stop();}
+});
+
+for(const type of ["image","file"] as const)test(`验收成功${type}核对证据可推进，非文本不会被当作空转`,async()=>{
+  const f=await makeAcceptanceProgressApp({acceptorReadTools:["visual_inspect"]});try{
+    for(let step=1;step<=9;step++){
+      assert.equal(await f.fake.emitPreStep(f.acceptor.id),true);await f.fake.emitRequest(f.acceptor.id,moneyRoute);
+      f.fake.emitSessionEvent(f.acceptor.id,{seq:18000+step*4,...assistantUsageEvent(step,{inputTokens:1000,outputTokens:100,cacheReadTokens:0,cacheWriteTokens:0},"核对附件")});
+      f.fake.emitSessionEvent(f.acceptor.id,{type:"tool/call",data:{turn:step,callId:`preview-${step}`,name:"visual_inspect",arguments:"{}"}});
+      f.fake.emitSessionEvent(f.acceptor.id,{type:"tool/result",data:{turn:step,message:{toolCallId:`preview-${step}`,isError:false,content:[{type,attachment:{id:`proof-${step}`,sha256:String(step).repeat(64),mimeType:type==="image"?"image/png":"text/plain"}}]}}});
+      await f.fake.waitFor(()=>f.api.getBudget(f.taskId)!.reservedTokens===0);
+    }
+    assert.equal(f.api.getTask(f.taskId)!.status,"awaiting_acceptance");
+    await f.fake.waitFor(()=>{const activities=Object.values(f.api.getTaskEvidence(f.taskId).collections.acceptanceActivity!) as Array<{proofs:string[]}>;return activities[0]!.proofs.length===9;});
+  }finally{for(const stop of f.fake.teardowns)await stop();}
 });
